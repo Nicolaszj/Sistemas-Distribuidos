@@ -93,7 +93,10 @@ Inspirado en los *block access tokens* de HDFS (`dfsha/cluster_auth.py`):
 Un ticket de un bloque no sirve para otro bloque, un ticket de lectura no sirve para
 escribir y un ticket vencido o firmado con otro secreto se rechaza (todo cubierto por pruebas).
 Para registro, heartbeat y replicación los nodos usan tokens de nodo firmados con el mismo
-secreto.
+secreto. El contrato interno de disponibilidad es `POST /nodes/register` seguido de
+`POST /nodes/{node_id}/heartbeat`, ambos con `X-Node-Token`. El ControlNode no acepta
+un heartbeat cuyo identificador no coincida con el sujeto del token y excluye nodos cuyo
+último heartbeat superó `DFSHA_NODE_TIMEOUT_SECONDS`.
 
 ## 8. RF3 — acceso a archivos
 

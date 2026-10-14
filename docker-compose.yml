@@ -1,0 +1,55 @@
+services:
+  controlnode:
+    build: .
+    environment:
+      DFSHA_HOME: /data
+      DFSHA_CLUSTER_SECRET: ${DFSHA_CLUSTER_SECRET:-compose-cluster-secret}
+      DFSHA_SECRET: ${DFSHA_SECRET:-compose-user-secret}
+      DFSHA_STORAGE_KEY: ${DFSHA_STORAGE_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      DFSHA_DATANODES: http://datanode1:8000,http://datanode2:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - control-data:/data
+    networks:
+      - dfsha
+
+  datanode1:
+    build: .
+    command: ["python", "-m", "dfsha.server.run"]
+    environment:
+      DFSHA_APP: dfsha.server.datanode:app
+      DFSHA_HOME: /data
+      DFSHA_NODE_ID: datanode1
+      DFSHA_DATANODE_URL: http://datanode1:8000
+      DFSHA_CONTROL_URL: http://controlnode:8000
+      DFSHA_CLUSTER_SECRET: ${DFSHA_CLUSTER_SECRET:-compose-cluster-secret}
+      DFSHA_STORAGE_KEY: ${DFSHA_STORAGE_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+    volumes:
+      - datanode1-data:/data
+    networks:
+      - dfsha
+
+  datanode2:
+    build: .
+    command: ["python", "-m", "dfsha.server.run"]
+    environment:
+      DFSHA_APP: dfsha.server.datanode:app
+      DFSHA_HOME: /data
+      DFSHA_NODE_ID: datanode2
+      DFSHA_DATANODE_URL: http://datanode2:8000
+      DFSHA_CONTROL_URL: http://controlnode:8000
+      DFSHA_CLUSTER_SECRET: ${DFSHA_CLUSTER_SECRET:-compose-cluster-secret}
+      DFSHA_STORAGE_KEY: ${DFSHA_STORAGE_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+    volumes:
+      - datanode2-data:/data
+    networks:
+      - dfsha
+
+volumes:
+  control-data:
+  datanode1-data:
+  datanode2-data:
+
+networks:
+  dfsha:

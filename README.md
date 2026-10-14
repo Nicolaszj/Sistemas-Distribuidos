@@ -5,8 +5,10 @@ Proyecto 1 de SI3007 Sistemas Distribuidos (2026-2). Opción 1: arquitectura cli
 Estado actual: versión C/S con **RF1** (gestión del sistema de archivos), **RF2**
 (transferencia), **RF3** (acceso: open/read/seek/write/close/lock) y la **capa de seguridad**
 (TLS, cifrado en reposo, 2FA, API keys, ACL por usuario y grupo, tickets de bloque entre nodos).
-El servidor cumple todavía el rol de ControlNode (metadatos) y de DataNode (bloques); en el hito 2
-esos roles se separan en procesos distintos sin cambiar el contrato del cliente.
+El servidor puede ejecutarse en modo monolítico o con los roles separados, sin cambiar el contrato del
+cliente. El modo distribuido registra DataNodes en el ControlNode, reparte bloques
+entre los nodos disponibles y devuelve URLs directas para que el cliente descargue
+bloques en paralelo. Sin configuración de DataNodes se conserva el modo monolítico.
 
 ## Estructura
 
@@ -21,6 +23,7 @@ dfsha/
     access.py         resolución de rutas /~usuario y verificación de ACL
     metadata.py       esquema y consultas SQLite (ControlNode)
     storage.py        bloques cifrados con AES-256-GCM en disco (DataNode)
+    datanode.py       API independiente de bloques y registro/heartbeat
     main.py           API REST (FastAPI)
     run.py            arranque del nodo, con TLS si hay certificados
   client/
@@ -67,6 +70,19 @@ docker run -p 8000:8000 -v dfsha-data:/data -v "$PWD/certs:/certs:ro" \
   -e DFSHA_TLS_CERT=/certs/controlnode.crt -e DFSHA_TLS_KEY=/certs/controlnode.key dfsha
 ```
 
+### Clúster local con Docker Compose
+
+La topología distribuida de desarrollo levanta un ControlNode y dos DataNodes:
+
+```bash
+docker compose up --build
+```
+
+El ControlNode queda en `http://localhost:8000`. Cada DataNode se registra al
+arrancar y envía `POST /nodes/{node_id}/heartbeat` periódicamente. Para producción,
+define `DFSHA_CLUSTER_SECRET`, `DFSHA_SECRET` y `DFSHA_STORAGE_KEY` en un archivo
+`.env`; los valores de ejemplo de Compose son solo para desarrollo.
+
 La documentación interactiva de la API queda en `https://localhost:8000/docs`.
 
 ### Pruebas
@@ -79,12 +95,26 @@ pytest -q
 Levantan un servidor real con TLS y prueban cifrado, tickets, 2FA, API keys, ACL, grupos,
 locks, lecturas por rango y checksums.
 
+Para comparar lecturas secuenciales y paralelas contra un servidor levantado:
+
+```bash
+python scripts/benchmark_transfers.py --server http://localhost:8000 \
+  --user demo --password contrasena --size-mb 32
+```
+
 ### Variables de entorno
 
 | Variable | Valor por defecto | Descripción |
 | --- | --- | --- |
 | `DFSHA_HOME` | `./data` | Carpeta con la base de metadatos y los bloques |
 | `DFSHA_BLOCK_SIZE` | `4194304` (4 MiB) | Tamaño de bloque en bytes |
+| `DFSHA_NODE_ID` | — | Identificador del DataNode |
+| `DFSHA_CONTROL_URL` | — | URL del ControlNode para registro/heartbeat |
+| `DFSHA_DATANODE_URL` | — | URL anunciada por el DataNode al ControlNode |
+| `DFSHA_DATANODES` | — | URLs estáticas opcionales; el inventario registrado tiene prioridad |
+| `DFSHA_NODE_HEARTBEAT_SECONDS` | `10` | Intervalo de heartbeat |
+| `DFSHA_NODE_TIMEOUT_SECONDS` | `30` | Tiempo sin heartbeat antes de excluir un nodo |
+| `DFSHA_NODE_CA` | — | CA para validar HTTPS de los DataNodes |
 | `DFSHA_PORT` | `8000` | Puerto del nodo (`run.py`) |
 | `DFSHA_TLS_CERT` / `DFSHA_TLS_KEY` | — | Certificado y llave del nodo; activan https |
 | `DFSHA_TLS_CA` | — | CA del clúster; con `DFSHA_TLS_REQUIRE_CLIENT_CERT=1` exige mTLS |
