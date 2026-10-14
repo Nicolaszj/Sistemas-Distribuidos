@@ -85,6 +85,19 @@ CREATE TABLE IF NOT EXISTS locks (
     expires_at REAL NOT NULL,
     PRIMARY KEY (owner_id, path)
 );
+
+CREATE TABLE IF NOT EXISTS nodes (
+    id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    last_heartbeat REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'online'
+);
+
+CREATE TABLE IF NOT EXISTS block_locations (
+    block_id TEXT NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    PRIMARY KEY (block_id, node_id)
+);
 """
 
 # Columnas agregadas después del hito 1; se crean en bases ya existentes.
@@ -308,6 +321,56 @@ def find_block(db, block_id):
         " JOIN files ON files.id = blocks.file_id WHERE blocks.id = ?",
         (block_id,),
     ).fetchone()
+
+
+def register_node(db, node_id, url, heartbeat):
+    db.execute(
+        "INSERT INTO nodes (id, url, last_heartbeat, status) VALUES (?, ?, ?, 'online')"
+        " ON CONFLICT(id) DO UPDATE SET url = excluded.url,"
+        " last_heartbeat = excluded.last_heartbeat, status = 'online'",
+        (node_id, url, heartbeat),
+    )
+
+
+def heartbeat_node(db, node_id, heartbeat):
+    cursor = db.execute(
+        "UPDATE nodes SET last_heartbeat = ?, status = 'online' WHERE id = ?",
+        (heartbeat, node_id),
+    )
+    return cursor.rowcount > 0
+
+
+def available_nodes(db, now_timestamp, timeout):
+    return db.execute(
+        "SELECT * FROM nodes WHERE status = 'online' AND last_heartbeat >= ? ORDER BY id",
+        (now_timestamp - timeout,),
+    ).fetchall()
+
+
+def set_block_location(db, block_id, node_id):
+    db.execute(
+        "INSERT OR IGNORE INTO block_locations (block_id, node_id) VALUES (?, ?)",
+        (block_id, node_id),
+    )
+
+
+def block_location(db, block_id):
+    return db.execute(
+        "SELECT nodes.id, nodes.url FROM block_locations"
+        " JOIN nodes ON nodes.id = block_locations.node_id"
+        " WHERE block_locations.block_id = ? AND nodes.status = 'online'"
+        " ORDER BY nodes.id LIMIT 1",
+        (block_id,),
+    ).fetchone()
+
+
+def block_locations(db, block_id):
+    return db.execute(
+        "SELECT nodes.id, nodes.url FROM block_locations"
+        " JOIN nodes ON nodes.id = block_locations.node_id"
+        " WHERE block_locations.block_id = ?",
+        (block_id,),
+    ).fetchall()
 
 
 def delete_file(db, file_id):

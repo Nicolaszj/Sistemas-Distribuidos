@@ -8,6 +8,17 @@ DATABASE_PATH = HOME / "metadata.db"
 BLOCKS_DIR = HOME / "blocks"
 
 BLOCK_SIZE = int(os.getenv("DFSHA_BLOCK_SIZE", 4 * 1024 * 1024))
+NODE_ID = os.getenv("DFSHA_NODE_ID", "")
+CONTROL_URL = os.getenv("DFSHA_CONTROL_URL", "").rstrip("/")
+DATANODE_URL = os.getenv("DFSHA_DATANODE_URL", "").rstrip("/")
+NODE_CA = os.getenv("DFSHA_NODE_CA") or os.getenv("DFSHA_CONTROL_CA") or True
+DATANODES = [
+    value.strip().rstrip("/")
+    for value in os.getenv("DFSHA_DATANODES", "").split(",")
+    if value.strip()
+]
+NODE_HEARTBEAT_SECONDS = int(os.getenv("DFSHA_NODE_HEARTBEAT_SECONDS", 10))
+NODE_TIMEOUT_SECONDS = int(os.getenv("DFSHA_NODE_TIMEOUT_SECONDS", 30))
 TOKEN_TTL_SECONDS = int(os.getenv("DFSHA_TOKEN_TTL", 3600))
 BLOCK_TICKET_TTL_SECONDS = int(os.getenv("DFSHA_BLOCK_TICKET_TTL", 300))
 LOCK_TTL_SECONDS = int(os.getenv("DFSHA_LOCK_TTL", 60))
