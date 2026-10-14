@@ -567,11 +567,14 @@ def _available_data_nodes():
         return nodes
 
 
-def _write_block_to_node(data, block_id):
+def _write_block_to_node(data, block_id, sequence=0):
     nodes = _available_data_nodes()
     if not nodes:
         storage.write(data, block_id)
         return None
+
+    start = sequence % len(nodes)
+    nodes = nodes[start:] + nodes[:start]
 
     ticket = cluster_auth.issue_block_ticket(
         config.CLUSTER_SECRET,
@@ -667,7 +670,12 @@ async def upload_file(
         with ThreadPoolExecutor(max_workers=max(1, min(8, len(pending) or 1))) as executor:
             node_ids = list(
                 executor.map(
-                    lambda item: _write_block_to_node(item[0], item[1]), pending
+                    lambda indexed_item: _write_block_to_node(
+                        indexed_item[1][0],
+                        indexed_item[1][1],
+                        indexed_item[0],
+                    ),
+                    enumerate(pending),
                 )
             )
         written = [
