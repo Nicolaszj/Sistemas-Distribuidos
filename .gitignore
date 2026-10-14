@@ -5,3 +5,7 @@ venv/
 data/
 *.db
 .env
+certs/
+*.key
+*.pem
+.pytest_cache/

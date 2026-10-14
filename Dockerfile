@@ -11,4 +11,5 @@ ENV DFSHA_HOME=/data
 VOLUME /data
 EXPOSE 8000
 
-CMD ["uvicorn", "dfsha.server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# TLS: montar los certificados y definir DFSHA_TLS_CERT / DFSHA_TLS_KEY.
+CMD ["python", "-m", "dfsha.server.run"]
