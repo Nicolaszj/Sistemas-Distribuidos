@@ -1,16 +1,59 @@
+# Topología de alta disponibilidad del ControlNode (hito 3).
+#
+#   controlnode-a  ControlNode principal (DFSHA_HA_ROLE=primary)
+#   controlnode-b  ControlNode de respaldo (DFSHA_HA_ROLE=standby) que replica el
+#                  oplog de A y se promueve si A cae
+#   datanode1/2    DataNodes; apuntan a AMBOS ControlNodes (DFSHA_CONTROL_URLS) y
+#                  se reportan al que esté como primary
+#
+# Los tres secretos (DFSHA_CLUSTER_SECRET, DFSHA_SECRET, DFSHA_STORAGE_KEY) son
+# IDÉNTICOS en ambos ControlNodes y se pasan por entorno: son los valores de
+# ejemplo SOLO para desarrollo. En producción, pásalos desde un archivo .env o un
+# gestor de secretos (ver README). Si se dejaran autogenerar por nodo, cada
+# contenedor tendría secretos distintos y el failover fallaría.
+#
+# Demo: tiempos agresivos (heartbeat 2s, timeout 6s) para que el failover se vea
+# rápido al matar el principal.
+
+x-control-secrets: &control-secrets
+  DFSHA_CLUSTER_SECRET: ${DFSHA_CLUSTER_SECRET:-compose-cluster-secret}
+  DFSHA_SECRET: ${DFSHA_SECRET:-compose-user-secret}
+  DFSHA_STORAGE_KEY: ${DFSHA_STORAGE_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+
 services:
-  controlnode:
+  controlnode-a:
     build: .
     environment:
+      <<: *control-secrets
       DFSHA_HOME: /data
-      DFSHA_CLUSTER_SECRET: ${DFSHA_CLUSTER_SECRET:-compose-cluster-secret}
-      DFSHA_SECRET: ${DFSHA_SECRET:-compose-user-secret}
-      DFSHA_STORAGE_KEY: ${DFSHA_STORAGE_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      DFSHA_HA_ROLE: primary
+      DFSHA_HA_PEER_URL: http://controlnode-b:8000
+      DFSHA_HA_HEARTBEAT_SECONDS: "2"
+      DFSHA_HA_TIMEOUT_SECONDS: "6"
+      DFSHA_HA_GRACE_SECONDS: "30"
       DFSHA_DATANODES: http://datanode1:8000,http://datanode2:8000
     ports:
       - "8000:8000"
     volumes:
-      - control-data:/data
+      - control-a-data:/data
+    networks:
+      - dfsha
+
+  controlnode-b:
+    build: .
+    environment:
+      <<: *control-secrets
+      DFSHA_HOME: /data
+      DFSHA_HA_ROLE: standby
+      DFSHA_HA_PEER_URL: http://controlnode-a:8000
+      DFSHA_HA_HEARTBEAT_SECONDS: "2"
+      DFSHA_HA_TIMEOUT_SECONDS: "6"
+      DFSHA_HA_GRACE_SECONDS: "30"
+      DFSHA_DATANODES: http://datanode1:8000,http://datanode2:8000
+    ports:
+      - "8001:8000"
+    volumes:
+      - control-b-data:/data
     networks:
       - dfsha
 
@@ -22,7 +65,8 @@ services:
       DFSHA_HOME: /data
       DFSHA_NODE_ID: datanode1
       DFSHA_DATANODE_URL: http://datanode1:8000
-      DFSHA_CONTROL_URL: http://controlnode:8000
+      # Reporta a ambos ControlNodes; usa el que esté como primary.
+      DFSHA_CONTROL_URLS: http://controlnode-a:8000,http://controlnode-b:8000
       DFSHA_CLUSTER_SECRET: ${DFSHA_CLUSTER_SECRET:-compose-cluster-secret}
       DFSHA_STORAGE_KEY: ${DFSHA_STORAGE_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
     volumes:
@@ -38,7 +82,7 @@ services:
       DFSHA_HOME: /data
       DFSHA_NODE_ID: datanode2
       DFSHA_DATANODE_URL: http://datanode2:8000
-      DFSHA_CONTROL_URL: http://controlnode:8000
+      DFSHA_CONTROL_URLS: http://controlnode-a:8000,http://controlnode-b:8000
       DFSHA_CLUSTER_SECRET: ${DFSHA_CLUSTER_SECRET:-compose-cluster-secret}
       DFSHA_STORAGE_KEY: ${DFSHA_STORAGE_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
     volumes:
@@ -47,7 +91,8 @@ services:
       - dfsha
 
 volumes:
-  control-data:
+  control-a-data:
+  control-b-data:
   datanode1-data:
   datanode2-data:
 

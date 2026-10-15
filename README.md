@@ -70,18 +70,37 @@ docker run -p 8000:8000 -v dfsha-data:/data -v "$PWD/certs:/certs:ro" \
   -e DFSHA_TLS_CERT=/certs/controlnode.crt -e DFSHA_TLS_KEY=/certs/controlnode.key dfsha
 ```
 
-### Clúster local con Docker Compose
+### Clúster local con Docker Compose (alta disponibilidad)
 
-La topología distribuida de desarrollo levanta un ControlNode y dos DataNodes:
+La topología de desarrollo levanta un ControlNode **principal** (A), un ControlNode
+**de respaldo** (B) y dos DataNodes:
 
 ```bash
 docker compose up --build
 ```
 
-El ControlNode queda en `http://localhost:8000`. Cada DataNode se registra al
-arrancar y envía `POST /nodes/{node_id}/heartbeat` periódicamente. Para producción,
-define `DFSHA_CLUSTER_SECRET`, `DFSHA_SECRET` y `DFSHA_STORAGE_KEY` en un archivo
-`.env`; los valores de ejemplo de Compose son solo para desarrollo.
+- ControlNode principal A: `http://localhost:8000` (`DFSHA_HA_ROLE=primary`).
+- ControlNode respaldo B: `http://localhost:8001` (`DFSHA_HA_ROLE=standby`); replica
+  el oplog de A y se promueve si A cae.
+- Los DataNodes apuntan a **ambos** ControlNodes (`DFSHA_CONTROL_URLS`) y se
+  reportan al que esté como primary.
+
+El cliente de la demo apunta a las dos URLs y reintenta solo si una no responde o
+responde "no soy el primary":
+
+```bash
+python -m dfsha.client.cli --server http://localhost:8000,http://localhost:8001 \
+    --user demo --register
+```
+
+Los secretos `DFSHA_CLUSTER_SECRET`, `DFSHA_SECRET` y `DFSHA_STORAGE_KEY` son
+**idénticos en ambos ControlNodes** y se pasan por entorno (obligatorio en HA). En
+producción, defínelos en un archivo `.env` o un gestor de secretos; los valores de
+ejemplo del Compose son solo para desarrollo.
+
+El guion completo de la demo de failover (matar el principal, ver la promoción,
+seguir operando contra el nuevo principal y comprobar que el viejo vuelve como
+standby) está en [`docs/alta-disponibilidad-controlnode.md`](docs/alta-disponibilidad-controlnode.md).
 
 La documentación interactiva de la API queda en `https://localhost:8000/docs`.
 
@@ -114,6 +133,14 @@ python scripts/benchmark_transfers.py --server http://localhost:8000 \
 | `DFSHA_DATANODES` | — | URLs estáticas opcionales; el inventario registrado tiene prioridad |
 | `DFSHA_NODE_HEARTBEAT_SECONDS` | `10` | Intervalo de heartbeat |
 | `DFSHA_NODE_TIMEOUT_SECONDS` | `30` | Tiempo sin heartbeat antes de excluir un nodo |
+| `DFSHA_CONTROL_URLS` | — | Lista de ControlNodes (coma) para el DataNode; alta disponibilidad. Compatible con `DFSHA_CONTROL_URL` (una sola) |
+| `DFSHA_HA_ROLE` | `primary` | Rol inicial del ControlNode: `primary` o `standby` |
+| `DFSHA_HA_PEER_URL` | — | URL del otro ControlNode (vacío = HA desactivado) |
+| `DFSHA_HA_PEER_CA` | hereda `DFSHA_NODE_CA` | CA para validar el TLS del par |
+| `DFSHA_HA_HEARTBEAT_SECONDS` | `3` | Intervalo de sincronización/heartbeat del standby |
+| `DFSHA_HA_TIMEOUT_SECONDS` | `10` | Sin respuesta del primary antes de promover (≥ 3× heartbeat) |
+| `DFSHA_HA_GRACE_SECONDS` | `30` | Gracia tras promoción: no excluye DataNodes por heartbeat viejo |
+| `DFSHA_HA_OPLOG_RETENTION` | `10000` | Máx. entradas de oplog antes de podar las confirmadas |
 | `DFSHA_NODE_CA` | — | CA para validar HTTPS de los DataNodes |
 | `DFSHA_PORT` | `8000` | Puerto del nodo (`run.py`) |
 | `DFSHA_TLS_CERT` / `DFSHA_TLS_KEY` | — | Certificado y llave del nodo; activan https |
@@ -201,6 +228,13 @@ Todas las rutas, salvo registro y login, requieren `Authorization: Bearer <token
 | GET | `/files/download?path=` | Devuelve el archivo reensamblado |
 | GET | `/files/blocks?path=` | Plan de bloques: id, tamaño, SHA-256 y ticket firmado |
 | GET | `/blocks/{id}[?offset=&length=]` | Contenido de un bloque o de un rango |
+| GET | `/ha/status` | Rol, época, última secuencia aplicada y par (token de nodo) |
+| GET | `/ha/oplog?after=&ack=&epoch=` | Entrega el oplog al standby; sirve de heartbeat (token de nodo) |
+| GET | `/ha/snapshot` | Copia binaria consistente de la base para el standby (token de nodo) |
+| POST | `/ha/promote` | Promoción manual asistida del standby (token de nodo + admin) |
+
+Un ControlNode en rol standby responde a las peticiones de cliente con
+`503 {"error":"not_primary","primary_url":...}`; el cliente reintenta en la otra URL.
 
 Ejemplo con `curl`:
 
@@ -262,6 +296,8 @@ incluirá la dirección del DataNode correspondiente.
 
 ## Pendiente
 
-- Hito 2: separar ControlNode y DataNodes, registro y heartbeat de nodos, ubicación de bloques
-  (los DataNodes usan `cluster_auth.verify_block_ticket` para autorizar).
-- Hito 3: replicación de bloques, consistencia y alta disponibilidad del ControlNode.
+- Hito 3 — alta disponibilidad del ControlNode: **hecho** (ControlNode de respaldo
+  con replicación de metadatos, failover y fencing; ver
+  [`docs/alta-disponibilidad-controlnode.md`](docs/alta-disponibilidad-controlnode.md)).
+- Hito 3 — replicación de bloques (factor 3), re-replicación automática al caer un
+  DataNode y lectura con failover entre réplicas (RF3, en ramas aparte).

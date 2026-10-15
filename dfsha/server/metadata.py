@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -98,7 +99,45 @@ CREATE TABLE IF NOT EXISTS block_locations (
     node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     PRIMARY KEY (block_id, node_id)
 );
+
+-- Alta disponibilidad del ControlNode (hito 3).
+-- oplog: registro ordenado de escrituras de metadatos para la replicación
+-- primary -> standby. Lo alimentan triggers (ver install_oplog_triggers), solo
+-- cuando el nodo actúa como primary.
+CREATE TABLE IF NOT EXISTS oplog (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    tbl TEXT NOT NULL,
+    op TEXT NOT NULL CHECK (op IN ('INSERT', 'UPDATE', 'DELETE')),
+    pk TEXT NOT NULL,
+    payload TEXT
+);
+
+-- ha_state: fila única (id=1) con la época (fencing), la última secuencia de
+-- oplog aplicada por el standby y el rol persistido.
+CREATE TABLE IF NOT EXISTS ha_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch INTEGER NOT NULL DEFAULT 0,
+    applied_seq INTEGER NOT NULL DEFAULT 0,
+    role TEXT NOT NULL DEFAULT 'primary'
+);
 """
+
+# Tablas de metadatos que se replican al standby. El orden importa al reaplicar un
+# snapshot/oplog por las claves foráneas (padres antes que hijos).
+REPLICATED_TABLES = [
+    "users",
+    "directories",
+    "files",
+    "blocks",
+    "api_keys",
+    "groups",
+    "group_members",
+    "acl",
+    "locks",
+    "nodes",
+    "block_locations",
+]
 
 # Columnas agregadas después del hito 1; se crean en bases ya existentes.
 MIGRATIONS = [
@@ -129,6 +168,158 @@ def initialize():
             columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
             if column not in columns:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        # Fila única de estado HA con el rol inicial configurado.
+        db.execute(
+            "INSERT OR IGNORE INTO ha_state (id, epoch, applied_seq, role)"
+            " VALUES (1, 0, 0, ?)",
+            (config.HA_ROLE,),
+        )
+        # Los triggers de captura del oplog solo existen en el nodo que actúa como
+        # primary. Un standby reaplica filas del oplog del primary y no debe
+        # generar un oplog propio (sería recursivo); por eso aquí se instalan solo
+        # si el rol inicial es primary y se eliminan en caso contrario.
+        if config.HA_ROLE == "primary":
+            install_oplog_triggers(db)
+        else:
+            drop_oplog_triggers(db)
+
+
+# --- Oplog y estado de HA (hito 3) ---------------------------------------------
+
+
+def _table_columns(db, table):
+    return [row["name"] for row in db.execute(f"PRAGMA table_info({table})")]
+
+
+def _primary_key_columns(db, table):
+    pk = [
+        row["name"]
+        for row in db.execute(f"PRAGMA table_info({table})")
+        if row["pk"]
+    ]
+    # Tablas sin PK declarada no existen entre las replicadas, pero por seguridad
+    # se cae a todas las columnas.
+    return pk or _table_columns(db, table)
+
+
+def _json_object_sql(columns, alias):
+    """SQL json_object('col', ALIAS.col, ...) para NEW/OLD dentro de un trigger."""
+    parts = []
+    for column in columns:
+        parts.append(f"'{column}', {alias}.{column}")
+    return "json_object(" + ", ".join(parts) + ")"
+
+
+# Expresión SQLite para la marca de tiempo Unix (segundos) dentro de un trigger.
+_TS_SQL = "(julianday('now') - 2440587.5) * 86400.0"
+
+
+def install_oplog_triggers(db):
+    """Crea, por cada tabla replicada, los triggers AFTER INSERT/UPDATE/DELETE que
+    registran la operación en `oplog`. Las columnas se derivan de la base, así que
+    si el esquema gana columnas los triggers siguen completos tras recrearlos.
+    """
+    for table in REPLICATED_TABLES:
+        columns = _table_columns(db, table)
+        pk_columns = _primary_key_columns(db, table)
+        pk_new = _json_object_sql(pk_columns, "NEW")
+        pk_old = _json_object_sql(pk_columns, "OLD")
+        payload_new = _json_object_sql(columns, "NEW")
+
+        # INSERT
+        db.execute(f"DROP TRIGGER IF EXISTS oplog_{table}_ai")
+        db.execute(
+            f"CREATE TRIGGER oplog_{table}_ai AFTER INSERT ON {table} BEGIN"
+            f" INSERT INTO oplog(ts, tbl, op, pk, payload) VALUES ("
+            f" {_TS_SQL}, '{table}', 'INSERT', {pk_new}, {payload_new});"
+            f" END"
+        )
+
+        # UPDATE. Caso especial `nodes`: no registrar los heartbeats (solo mueven
+        # last_heartbeat); sí registrar cambios de url o status (D8).
+        db.execute(f"DROP TRIGGER IF EXISTS oplog_{table}_au")
+        when = ""
+        if table == "nodes":
+            when = " WHEN NEW.url IS NOT OLD.url OR NEW.status IS NOT OLD.status"
+        db.execute(
+            f"CREATE TRIGGER oplog_{table}_au AFTER UPDATE ON {table}{when} BEGIN"
+            f" INSERT INTO oplog(ts, tbl, op, pk, payload) VALUES ("
+            f" {_TS_SQL}, '{table}', 'UPDATE', {pk_new}, {payload_new});"
+            f" END"
+        )
+
+        # DELETE (payload NULL: basta la pk para borrar en el standby).
+        db.execute(f"DROP TRIGGER IF EXISTS oplog_{table}_ad")
+        db.execute(
+            f"CREATE TRIGGER oplog_{table}_ad AFTER DELETE ON {table} BEGIN"
+            f" INSERT INTO oplog(ts, tbl, op, pk, payload) VALUES ("
+            f" {_TS_SQL}, '{table}', 'DELETE', {pk_old}, NULL);"
+            f" END"
+        )
+
+
+def drop_oplog_triggers(db):
+    for table in REPLICATED_TABLES:
+        for suffix in ("ai", "au", "ad"):
+            db.execute(f"DROP TRIGGER IF EXISTS oplog_{table}_{suffix}")
+
+
+def read_oplog(db, after, limit=1000):
+    """Entradas con seq > after, en orden, hasta `limit`."""
+    return db.execute(
+        "SELECT seq, ts, tbl, op, pk, payload FROM oplog"
+        " WHERE seq > ? ORDER BY seq LIMIT ?",
+        (after, limit),
+    ).fetchall()
+
+
+def oplog_bounds(db):
+    """(seq más antigua, seq más nueva) del oplog; (0, 0) si está vacío."""
+    row = db.execute("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM oplog").fetchone()
+    return (row["lo"] or 0, row["hi"] or 0)
+
+
+def apply_oplog_entry(db, entry):
+    """Reaplica una entrada de oplog en el standby de forma idempotente.
+
+    INSERT/UPDATE: INSERT OR REPLACE con la fila completa del payload.
+    DELETE: borra por clave primaria.
+    """
+    table = entry["tbl"]
+    operation = entry["op"]
+    if operation in ("INSERT", "UPDATE"):
+        data = json.loads(entry["payload"])
+        columns = list(data.keys())
+        placeholders = ", ".join("?" for _ in columns)
+        column_list = ", ".join(columns)
+        db.execute(
+            f"INSERT OR REPLACE INTO {table} ({column_list}) VALUES ({placeholders})",
+            [data[column] for column in columns],
+        )
+    elif operation == "DELETE":
+        key = json.loads(entry["pk"])
+        clause = " AND ".join(f"{column} = ?" for column in key)
+        db.execute(f"DELETE FROM {table} WHERE {clause}", list(key.values()))
+
+
+def prune_oplog(db, upto):
+    """Borra entradas con seq <= upto (ya confirmadas por el standby)."""
+    if upto > 0:
+        db.execute("DELETE FROM oplog WHERE seq <= ?", (upto,))
+
+
+def get_ha_state(db):
+    return db.execute("SELECT epoch, applied_seq, role FROM ha_state WHERE id = 1").fetchone()
+
+
+def set_ha_state(db, **columns):
+    if not columns:
+        return
+    assignments = ", ".join(f"{column} = ?" for column in columns)
+    db.execute(
+        f"UPDATE ha_state SET {assignments} WHERE id = 1",
+        list(columns.values()),
+    )
 
 
 def now():
@@ -340,7 +531,21 @@ def heartbeat_node(db, node_id, heartbeat):
     return cursor.rowcount > 0
 
 
-def available_nodes(db, now_timestamp, timeout):
+def available_nodes(db, now_timestamp, timeout, grace=False):
+    """DataNodes considerados vivos.
+
+    Comportamiento normal (grace=False): online y con heartbeat dentro de la
+    ventana de timeout, idéntico a antes del hito 3.
+
+    Durante el periodo de gracia tras una promoción (grace=True) no se filtra por
+    la antigüedad del heartbeat: el `last_heartbeat` replicado quedó viejo tras el
+    failover y aún no llegan los re-registros del nuevo primary, así que excluir
+    por tiempo marcaría caídos a DataNodes que están vivos (R9).
+    """
+    if grace:
+        return db.execute(
+            "SELECT * FROM nodes WHERE status = 'online' ORDER BY id"
+        ).fetchall()
     return db.execute(
         "SELECT * FROM nodes WHERE status = 'online' AND last_heartbeat >= ? ORDER BY id",
         (now_timestamp - timeout,),

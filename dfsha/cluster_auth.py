@@ -47,8 +47,12 @@ def verify_block_ticket(secret, ticket, block_id, operation=READ):
     return payload
 
 
-def issue_node_token(secret, node_id, ttl=60):
+def issue_node_token(secret, node_id, ttl=60, admin=False):
+    """Token de nodo. Con `admin=True` lleva el claim `adm` que autoriza las
+    operaciones de operador del clúster (p. ej. promover manualmente un standby)."""
     payload = {"typ": "node", "sub": node_id, "exp": int(time.time()) + ttl}
+    if admin:
+        payload["adm"] = True
     return jwt.encode(payload, secret, algorithm=ALGORITHM)
 
 
@@ -56,6 +60,22 @@ def verify_node_token(secret, token):
     payload = _decode(secret, token)
     if payload.get("typ") != "node":
         raise InvalidClusterToken("No es un token de nodo")
+    return payload["sub"]
+
+
+def issue_admin_token(secret, node_id="operator", ttl=60):
+    """Token de operador del clúster para endpoints privilegiados (/ha/promote)."""
+    return issue_node_token(secret, node_id, ttl=ttl, admin=True)
+
+
+def verify_admin_token(secret, token):
+    """Verifica que el token sea de nodo y tenga el claim de operador. Devuelve el
+    sujeto (quién promueve) para registro/depuración."""
+    payload = _decode(secret, token)
+    if payload.get("typ") != "node":
+        raise InvalidClusterToken("No es un token de nodo")
+    if not payload.get("adm"):
+        raise InvalidClusterToken("El token no es de operador (falta claim adm)")
     return payload["sub"]
 
 
