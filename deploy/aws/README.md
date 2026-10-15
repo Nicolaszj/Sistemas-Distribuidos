@@ -49,9 +49,17 @@ reemplaza `{{NODE}}`, `{{SELF_EIP}}` y `{{EIP_<nodo>}}` por los valores reales y
 
 - `DFSHA_TLS_CERT`, `DFSHA_TLS_KEY`, `DFSHA_TLS_CA`: certificado del nodo y CA del clúster.
 - `DFSHA_SECRET`, `DFSHA_CLUSTER_SECRET`: iguales en todos los nodos (`out/secrets.env`).
+- `DFSHA_STORAGE_KEY`: solo en los dos ControlNodes y la misma en ambos
+  (`out/cn-secrets.env`), porque el respaldo reemplaza al primario.
 
-La llave AES de los bloques (`DFSHA_STORAGE_KEY`) no se reparte: cada nodo genera la suya
-en su volumen y nunca sale de la máquina.
+Alta disponibilidad: cn1 arranca como primario y cn2 como respaldo (`DFSHA_HA_ROLE`,
+`DFSHA_HA_PEER_URL`); los DataNodes conocen a los dos (`DFSHA_CONTROL_URLS`) y el
+cliente también: `--server https://<cn1>:8000,https://<cn2>:8000`. La columna HA de
+`status.sh` muestra el rol y la época de cada ControlNode.
+
+La llave AES de los bloques de los DataNodes no se reparte: cada DataNode genera la suya
+en su volumen y nunca sale de la máquina. Cuando un bloque se re-replica, el DataNode
+origen lo descifra con su llave y el destino lo vuelve a cifrar con la propia.
 
 ## Seguridad del despliegue
 

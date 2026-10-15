@@ -11,6 +11,7 @@ from typing import Optional
 import requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from .. import cluster_auth
 from . import config, storage
@@ -91,6 +92,56 @@ def delete_block(
     _ticket(ticket, block_id, cluster_auth.WRITE)
     storage.remove(block_id)
     return {"id": block_id, "removed": True}
+
+
+class CopyRequest(BaseModel):
+    target_url: str
+
+
+@app.post("/blocks/{block_id}/copy-to")
+def copy_block(
+    block_id: str,
+    request: CopyRequest,
+    token: Optional[str] = Header(None, alias="X-Node-Token"),
+):
+    """Re-replicación DataNode → DataNode: el ControlNode le pide a este nodo que
+    envíe un bloque que tiene a otro DataNode. Solo lo puede pedir un nodo del
+    clúster (token firmado con el secreto del clúster). Este nodo descifra el bloque
+    con su llave, se firma un ticket de escritura y lo sube al destino, que lo vuelve
+    a cifrar con la suya."""
+    if not _valid_block_id(block_id):
+        raise HTTPException(status_code=400, detail="Identificador de bloque inválido")
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta X-Node-Token")
+    try:
+        cluster_auth.verify_node_token(config.CLUSTER_SECRET, token)
+    except cluster_auth.InvalidClusterToken as error:
+        raise HTTPException(status_code=403, detail=f"Token de nodo inválido: {error}")
+    if not request.target_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="URL de destino inválida")
+
+    try:
+        data = storage.read(block_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="El bloque no está en este nodo")
+    except storage.CorruptBlock as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+    ticket = cluster_auth.issue_block_ticket(
+        config.CLUSTER_SECRET, block_id, cluster_auth.WRITE, config.BLOCK_TICKET_TTL_SECONDS
+    )
+    try:
+        response = requests.put(
+            f"{request.target_url.rstrip('/')}/blocks/{block_id}",
+            data=data,
+            headers={"X-Block-Ticket": ticket},
+            verify=config.NODE_CA,
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise HTTPException(status_code=502, detail=f"No se pudo copiar al destino: {error}")
+    return {"id": block_id, "copied_to": request.target_url, "size": len(data)}
 
 
 def _register_once(base_url, payload, verify):

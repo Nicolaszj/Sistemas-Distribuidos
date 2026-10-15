@@ -21,6 +21,7 @@ from . import config, ha, metadata
 
 _stop = threading.Event()
 _thread = None
+_bootstrapped = False  # True tras la primera copia completa de este arranque
 
 
 def _node_token():
@@ -59,10 +60,17 @@ def _pull_once(state):
             metadata.set_ha_state(db, epoch=peer_epoch)
         state.epoch = peer_epoch
 
+    global _bootstrapped
     oldest = data.get("oldest_seq", 0)
-    # Hueco por poda: el primary ya no tiene las entradas que nos faltan.
-    if oldest and state.applied_seq + 1 < oldest:
+    # Copia completa (snapshot) en dos casos:
+    #  - Primera sincronización desde que arrancó este standby: el oplog solo tiene
+    #    lo escrito desde que el primary instaló sus triggers, así que los datos
+    #    anteriores (p. ej. usuarios creados antes de activar la HA, o lo que
+    #    divergió en un primary viejo que volvió como standby) nunca llegarían.
+    #  - Hueco por poda: el primary ya no tiene las entradas que nos faltan.
+    if not _bootstrapped or (oldest and state.applied_seq + 1 < oldest):
         _snapshot(state, token, verify, base)
+        _bootstrapped = True
         return True
 
     entries = data.get("entries", [])
@@ -134,8 +142,9 @@ def start(state=None):
     Un primary con par primero reconcilia: si descubre que el par ya es primary con
     una época >= a la suya, se degrada (fencing de un primary viejo que vuelve) y
     entonces sí arranca el replicador."""
-    global _thread
+    global _thread, _bootstrapped
     state = state or ha.state
+    _bootstrapped = False
     if not state.peer_url:
         return None
     should_follow = reconcile_on_start(state)

@@ -59,10 +59,16 @@ reconstruye tras el failover con el periodo de gracia (§6) y los re-registros.
 
 ### 3.2 Snapshot inicial
 
-Cuando el standby arranca o queda por detrás del punto más antiguo del oplog (por
-poda), pide `GET /ha/snapshot`: una copia binaria y consistente de `metadata.db`
+Cuando el standby arranca (su primera sincronización tras cada arranque) o queda
+por detrás del punto más antiguo del oplog (por poda), pide `GET /ha/snapshot`: una copia binaria y consistente de `metadata.db`
 hecha con la **API de backup online de SQLite** (segura con escrituras
 concurrentes). El standby la escribe tal cual y continúa con el oplog incremental.
+
+La copia completa al arrancar es necesaria aunque el oplog no tenga huecos: el
+oplog solo contiene lo escrito desde que el primary instaló sus triggers. Los
+datos creados antes de activar la HA (por ejemplo, usuarios de un despliegue que
+ya estaba en uso) nunca pasaron por el oplog y, sin esa copia, no llegarían al
+standby; tras un failover esos usuarios no podrían entrar.
 
 ### 3.3 Modelo pull
 

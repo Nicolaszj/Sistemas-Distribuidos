@@ -41,6 +41,10 @@ for node in "${TARGETS[@]}"; do
   cp "$OUT/certs/$node.crt" "$dir/certs/node.crt"
   cp "$OUT/certs/$node.key" "$dir/certs/node.key"
   cp "$OUT/secrets.env" "$dir/secrets.env"
+  if [ "$(role_of "$node")" = controlnode ]; then
+    [ -f "$OUT/cn-secrets.env" ] || { echo "Falta $OUT/cn-secrets.env: ejecuta deploy/aws/02-certs.sh" >&2; exit 1; }
+    cat "$OUT/cn-secrets.env" >>"$dir/secrets.env"
+  fi
   cp "$HERE/node-run.sh" "$dir/node-run.sh"
   printf 'NODE=%s\nROLE=%s\nBRANCH=%s\nREPO=%s\n' "$node" "$(role_of "$node")" "$BRANCH" "$REPO_URL" >"$dir/deploy.env"
   {

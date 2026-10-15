@@ -10,3 +10,4 @@ certs/
 *.pem
 .pytest_cache/
 deploy/aws/out/
+evidencias/

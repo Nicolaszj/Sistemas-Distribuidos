@@ -40,6 +40,10 @@ DATANODES = [
 ]
 NODE_HEARTBEAT_SECONDS = int(os.getenv("DFSHA_NODE_HEARTBEAT_SECONDS", 10))
 NODE_TIMEOUT_SECONDS = int(os.getenv("DFSHA_NODE_TIMEOUT_SECONDS", 30))
+# Réplicas por bloque (se usan min(factor, DataNodes vivos)) y cada cuánto el
+# ControlNode primario revisa bloques con réplicas faltantes (0 = desactivado).
+REPLICATION_FACTOR = max(1, int(os.getenv("DFSHA_REPLICATION_FACTOR", 3)))
+REREPLICATION_SECONDS = int(os.getenv("DFSHA_REREPLICATION_SECONDS", 15))
 
 # --- Alta disponibilidad del ControlNode (hito 3) ------------------------------
 # Rol inicial del ControlNode. Puede cambiar en runtime por promoción/degradación

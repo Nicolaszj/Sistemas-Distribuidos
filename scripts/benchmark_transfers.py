@@ -3,6 +3,8 @@
 Uso:
     python scripts/benchmark_transfers.py --server http://localhost:8000 \
         --user demo --password contrasena --size-mb 32
+    python scripts/benchmark_transfers.py --server https://cn1:8000,https://cn2:8000 \
+        --ca ca.crt --api-key "$(cat ~/.dfsha-key)" --size-mb 32
 """
 
 import argparse
@@ -10,21 +12,32 @@ import hashlib
 import io
 import time
 
-from dfsha.client.api import DfsClient
+import sys
+from pathlib import Path
+
+# Permite ejecutarlo como `python scripts/benchmark_transfers.py` desde la raíz.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dfsha.client.api import DfsClient  # noqa: E402
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
-    parser.add_argument("--user", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--user")
+    parser.add_argument("--password")
+    parser.add_argument("--api-key", help="alternativa a --user/--password")
     parser.add_argument("--ca")
     parser.add_argument("--size-mb", type=int, default=32)
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
 
-    client = DfsClient(args.server, ca_file=args.ca)
-    client.login(args.user, args.password)
+    servers = [url.strip() for url in args.server.split(",") if url.strip()]
+    client = DfsClient(servers, ca_file=args.ca, api_key=args.api_key)
+    if not args.api_key:
+        if not (args.user and args.password):
+            parser.error("usa --api-key o --user y --password")
+        client.login(args.user, args.password)
     payload = (b"dfsha-benchmark-" * (args.size_mb * 1024 * 1024 // 16 + 1))[
         : args.size_mb * 1024 * 1024
     ]

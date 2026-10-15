@@ -231,14 +231,27 @@ class DfsClient:
             block = {"id": block, "url": f"/blocks/{block}"}
 
         headers = {"X-Block-Ticket": block["ticket"]} if block.get("ticket") else {}
-        url = block.get("url", f"/blocks/{block['id']}")
-        data = self.request("GET", url, params=params, extra_headers=headers).content
-
+        # Réplicas en orden de preferencia: si una no responde o llega dañada
+        # (checksum distinto), se intenta la siguiente.
+        candidates = block.get("replicas") or [block.get("url", f"/blocks/{block['id']}")]
         whole = offset == 0 and length is None
-        if whole and block.get("checksum"):
-            if hashlib.sha256(data).hexdigest() != block["checksum"]:
-                raise IntegrityError(f"El bloque {block['id']} no coincide con su checksum")
-        return data
+        last_error = None
+        for url in candidates:
+            try:
+                data = self.request("GET", url, params=params, extra_headers=headers).content
+            except OtpRequired:
+                raise
+            except DfsError as error:
+                last_error = error
+                continue
+            if whole and block.get("checksum"):
+                if hashlib.sha256(data).hexdigest() != block["checksum"]:
+                    last_error = IntegrityError(
+                        f"El bloque {block['id']} no coincide con su checksum en {url}"
+                    )
+                    continue
+            return data
+        raise last_error
 
     def read_blocks_parallel(self, blocks, max_workers=None):
         """Descarga bloques independientes en paralelo y conserva su orden."""

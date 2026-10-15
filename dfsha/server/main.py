@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
 from .. import cluster_auth, paths
-from . import access, auth, config, ha, metadata, replicator, storage, totp
+from . import access, auth, config, ha, metadata, replication, replicator, storage, totp
 
 app = FastAPI(title="DFSha", version="0.2.0")
 bearer = HTTPBearer(auto_error=False)
@@ -224,11 +224,14 @@ def _start_replicator():
     """Si el nodo arranca como standby con un par configurado, lanza el hilo que
     replica el oplog y vigila al primary para el failover."""
     replicator.start(ha.state)
+    # Re-replicación de bloques: solo actúa mientras este nodo sea el primario.
+    replication.start(_available_data_nodes)
 
 
 @app.on_event("shutdown")
 def _stop_replicator():
     replicator.stop()
+    replication.stop()
 
 
 # --- Autenticación --------------------------------------------------------------
@@ -627,11 +630,12 @@ def remove_file(path: str, user_id: int = Depends(current_user)):
         check_lock(db, where, user_id)
 
         block_ids = [row["id"] for row in metadata.file_blocks(db, file["id"])]
+        replicas = {block_id: _replica_map(db, block_id) for block_id in block_ids}
         metadata.delete_file(db, file["id"])
         metadata.delete_lock(db, where.owner_id, where.path)
 
     for block_id in block_ids:
-        storage.remove(block_id)
+        _remove_block(block_id, replicas[block_id])
 
     return {"path": where.display, "removed_blocks": len(block_ids)}
 
@@ -696,59 +700,30 @@ def _available_data_nodes():
 
 
 def _write_block_to_node(data, block_id, sequence=0):
+    """Guarda el bloque en sus réplicas y devuelve la lista de DataNodes. Sin
+    DataNodes (modo monolítico) lo guarda en el disco del propio ControlNode."""
     nodes = _available_data_nodes()
     if not nodes:
         storage.write(data, block_id)
-        return None
-
-    start = sequence % len(nodes)
-    nodes = nodes[start:] + nodes[:start]
-
-    ticket = cluster_auth.issue_block_ticket(
-        config.CLUSTER_SECRET,
-        block_id,
-        cluster_auth.WRITE,
-        config.BLOCK_TICKET_TTL_SECONDS,
-    )
-    verify = config.NODE_CA
-    for node in nodes:
-        try:
-            response = requests.put(
-                f"{node['url']}/blocks/{block_id}",
-                data=data,
-                headers={"X-Block-Ticket": ticket},
-                verify=verify,
-                timeout=30,
-            )
-            response.raise_for_status()
-            return node["id"]
-        except requests.RequestException:
-            continue
-    raise HTTPException(status_code=503, detail="Ningún DataNode pudo guardar el bloque")
+        return []
+    return replication.write_replicas(data, block_id, nodes, sequence)
 
 
-def _remove_block_from_node(block_id, node_id):
-    if not node_id:
+def _replica_map(db, block_id):
+    """{node_id: url} de todas las réplicas registradas de un bloque."""
+    return {row["id"]: row["url"] for row in metadata.block_locations(db, block_id)}
+
+
+def _remove_block(block_id, replicas):
+    """Borra un bloque de todos sus DataNodes (o del disco local en modo monolítico)."""
+    if replicas:
+        replication.remove_replicas(block_id, replicas)
+    else:
         storage.remove(block_id)
-        return
-    with metadata.connect() as db:
-        node = db.execute("SELECT url FROM nodes WHERE id = ?", (node_id,)).fetchone()
-    if node is None:
-        return
-    ticket = cluster_auth.issue_block_ticket(
-        config.CLUSTER_SECRET, block_id, cluster_auth.WRITE,
-        config.BLOCK_TICKET_TTL_SECONDS,
-    )
-    try:
-        response = requests.delete(
-            f"{node['url']}/blocks/{block_id}",
-            headers={"X-Block-Ticket": ticket},
-            verify=config.NODE_CA,
-            timeout=10,
-        )
-        response.raise_for_status()
-    except requests.RequestException:
-        print(f"ADVERTENCIA: no se pudo limpiar el bloque {block_id} en {node_id}")
+
+
+def _alive_ids():
+    return {node["id"] for node in _available_data_nodes()}
 
 
 @app.post("/files/upload", status_code=201)
@@ -810,7 +785,7 @@ async def upload_file(
             (item[1], item[2], item[3]) for item in pending
         ]
         locations.update(
-            {item[1]: node_id for item, node_id in zip(pending, node_ids) if node_id}
+            {item[1]: node_list for item, node_list in zip(pending, node_ids) if node_list}
         )
 
         size = sum(block_size for _, block_size, _ in written)
@@ -826,25 +801,25 @@ async def upload_file(
                 )
             elif overwrite:
                 old_locations = {
-                    row["id"]: row["id"]
+                    row["id"]: _replica_map(db, row["id"])
                     for row in metadata.file_blocks(db, current["id"])
                 }
-                for block_id in old_locations:
-                    location = metadata.block_location(db, block_id)
-                    old_locations[block_id] = location["id"] if location else None
                 old_blocks = metadata.replace_file(db, current["id"], size, written, checksum)
             else:
                 raise HTTPException(status_code=409, detail=f"Ya existe el archivo {path}")
-            for block_id, node_id in locations.items():
-                metadata.set_block_location(db, block_id, node_id)
+            for block_id, node_list in locations.items():
+                for node_id in node_list:
+                    metadata.set_block_location(db, block_id, node_id)
     except BaseException:
         # Una subida fallida no deja bloques huérfanos ni un archivo a medias.
+        with metadata.connect() as db:
+            urls = {row["id"]: row["url"] for row in db.execute("SELECT id, url FROM nodes")}
         for block_id, _, _ in written:
-            _remove_block_from_node(block_id, locations.get(block_id))
+            _remove_block(block_id, {n: urls[n] for n in locations.get(block_id, []) if n in urls})
         raise
 
     for block_id in old_blocks:
-        _remove_block_from_node(block_id, old_locations.get(block_id))
+        _remove_block(block_id, old_locations.get(block_id, {}))
 
     return {
         "path": paths.normalize(path),
@@ -860,37 +835,46 @@ def download_file(path: str, user_id: int = Depends(current_user)):
     with metadata.connect() as db:
         _, file = access.file(db, user_id, path)
         block_rows = metadata.file_blocks(db, file["id"])
-        locations = {
-            row["id"]: metadata.block_location(db, row["id"]) for row in block_rows
+        alive = _alive_ids()
+        replicas = {
+            row["id"]: replication.replica_urls(db, row["id"], alive) for row in block_rows
         }
 
     def blocks():
         for row in block_rows:
-            location = locations[row["id"]]
-            if location:
-                ticket = cluster_auth.issue_block_ticket(
-                    config.CLUSTER_SECRET,
-                    row["id"],
-                    cluster_auth.READ,
-                    config.BLOCK_TICKET_TTL_SECONDS,
-                    user_id,
-                )
+            urls = replicas[row["id"]]
+            if not urls:
+                yield storage.read(row["id"])
+                continue
+            ticket = cluster_auth.issue_block_ticket(
+                config.CLUSTER_SECRET,
+                row["id"],
+                cluster_auth.READ,
+                config.BLOCK_TICKET_TTL_SECONDS,
+                user_id,
+            )
+            last_error = None
+            for url in urls:  # failover entre réplicas
                 try:
                     response = requests.get(
-                        f"{location['url']}/blocks/{row['id']}",
+                        f"{url}/blocks/{row['id']}",
                         headers={"X-Block-Ticket": ticket},
                         verify=config.NODE_CA,
                         timeout=30,
                     )
                     response.raise_for_status()
+                    if hashlib.sha256(response.content).hexdigest() != row["checksum"]:
+                        last_error = f"checksum distinto en {url}"
+                        continue
                     yield response.content
-                    continue
+                    break
                 except requests.RequestException as error:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"No se pudo descargar el bloque {row['id']}: {error}",
-                    )
-            yield storage.read(row["id"])
+                    last_error = error
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Ninguna réplica del bloque {row['id']} respondió: {last_error}",
+                )
 
     return StreamingResponse(
         blocks(),
@@ -906,8 +890,13 @@ def list_file_blocks(path: str, user_id: int = Depends(current_user)):
     with metadata.connect() as db:
         where, file = access.file(db, user_id, path)
         rows = metadata.file_blocks(db, file["id"])
-        locations = {
-            row["id"]: metadata.block_location(db, row["id"]) for row in rows
+        alive = _alive_ids()
+        replicas = {
+            row["id"]: [
+                f"{url}/blocks/{row['id']}"
+                for url in replication.replica_urls(db, row["id"], alive)
+            ]
+            for row in rows
         }
 
     return {
@@ -921,11 +910,10 @@ def list_file_blocks(path: str, user_id: int = Depends(current_user)):
                 "sequence": row["sequence"],
                 "size": row["size"],
                 "checksum": row["checksum"],
-                "url": (
-                    f"{location['url']}/blocks/{row['id']}"
-                    if (location := locations[row["id"]]) is not None
-                    else f"/blocks/{row['id']}"
-                ),
+                # url: réplica preferida (un nodo vivo); replicas: todas, en orden,
+                # para que el cliente pase a la siguiente si una falla.
+                "url": (replicas[row["id"]] or [f"/blocks/{row['id']}"])[0],
+                "replicas": replicas[row["id"]] or [f"/blocks/{row['id']}"],
                 "ticket": cluster_auth.issue_block_ticket(
                     config.CLUSTER_SECRET,
                     row["id"],

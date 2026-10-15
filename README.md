@@ -10,6 +10,12 @@ cliente. El modo distribuido registra DataNodes en el ControlNode, reparte bloqu
 entre los nodos disponibles y devuelve URLs directas para que el cliente descargue
 bloques en paralelo. Sin configuración de DataNodes se conserva el modo monolítico.
 
+Alta disponibilidad: cada bloque se guarda en 3 DataNodes (re-replicación automática y
+lectura con failover entre réplicas, ver [`docs/replicacion-bloques.md`](docs/replicacion-bloques.md))
+y el ControlNode tiene un respaldo que replica los metadatos y toma el control si el
+principal cae (ver [`docs/alta-disponibilidad-controlnode.md`](docs/alta-disponibilidad-controlnode.md)).
+El despliegue en AWS está en [`deploy/aws/README.md`](deploy/aws/README.md).
+
 ## Estructura
 
 ```
@@ -133,6 +139,8 @@ python scripts/benchmark_transfers.py --server http://localhost:8000 \
 | `DFSHA_DATANODES` | — | URLs estáticas opcionales; el inventario registrado tiene prioridad |
 | `DFSHA_NODE_HEARTBEAT_SECONDS` | `10` | Intervalo de heartbeat |
 | `DFSHA_NODE_TIMEOUT_SECONDS` | `30` | Tiempo sin heartbeat antes de excluir un nodo |
+| `DFSHA_REPLICATION_FACTOR` | `3` | Réplicas por bloque (se usan `min(factor, DataNodes vivos)`) |
+| `DFSHA_REREPLICATION_SECONDS` | `15` | Cada cuánto el ControlNode primario repone réplicas faltantes |
 | `DFSHA_CONTROL_URLS` | — | Lista de ControlNodes (coma) para el DataNode; alta disponibilidad. Compatible con `DFSHA_CONTROL_URL` (una sola) |
 | `DFSHA_HA_ROLE` | `primary` | Rol inicial del ControlNode: `primary` o `standby` |
 | `DFSHA_HA_PEER_URL` | — | URL del otro ControlNode (vacío = HA desactivado) |
@@ -299,5 +307,6 @@ incluirá la dirección del DataNode correspondiente.
 - Hito 3 — alta disponibilidad del ControlNode: **hecho** (ControlNode de respaldo
   con replicación de metadatos, failover y fencing; ver
   [`docs/alta-disponibilidad-controlnode.md`](docs/alta-disponibilidad-controlnode.md)).
-- Hito 3 — replicación de bloques (factor 3), re-replicación automática al caer un
-  DataNode y lectura con failover entre réplicas (RF3, en ramas aparte).
+- Hito 3 — replicación de bloques: **hecho** (factor 3, re-replicación automática
+  DataNode → DataNode y lectura con failover entre réplicas; ver
+  [`docs/replicacion-bloques.md`](docs/replicacion-bloques.md)).

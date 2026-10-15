@@ -587,6 +587,39 @@ def test_promocion_por_timeout(monkeypatch, tmp_path):
     assert state.epoch == 1
 
 
+def test_standby_copia_completa_al_arrancar(monkeypatch, tmp_path):
+    """Un standby recién arrancado pide snapshot en su primera sincronización aunque
+    el oplog del primary no tenga huecos: así recibe también los datos creados antes
+    de activar la HA (que nunca pasaron por el oplog). Después sigue con el oplog."""
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata, replicator
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    metadata.initialize()
+    state = ha.HaState().load()
+    monkeypatch.setattr(ha, "state", state)
+    state.peer_url = "https://primary:8000"
+
+    class _Oplog:
+        ok = True
+        status_code = 200
+
+        def json(self):
+            # oplog sin huecos (vacío): antes del arreglo NO se pedía snapshot
+            return {"epoch": 0, "oldest_seq": 0, "latest_seq": 0, "entries": []}
+
+    snapshots = []
+    monkeypatch.setattr(replicator.requests, "get", lambda *a, **k: _Oplog())
+    monkeypatch.setattr(replicator, "_snapshot", lambda *a, **k: snapshots.append(1))
+    monkeypatch.setattr(replicator, "_bootstrapped", False)
+
+    assert replicator._pull_once(state) is True
+    assert snapshots == [1]          # primera sincronización: copia completa
+    assert replicator._pull_once(state) is True
+    assert snapshots == [1]          # siguientes: solo oplog incremental
+
+
 # --- Tarea 7: periodo de gracia de DataNodes tras promoción ---------------------
 
 
