@@ -232,3 +232,14 @@ docker compose down -v   # limpiar al terminar
    la lectura con failover entre réplicas son **RF3** y se implementan en las ramas
    siguientes (`feature/replicacion-rf3`, `feature/re-replicacion`,
    `feature/lectura-failover`), partiendo de la rama de DataNodes ya integrada.
+
+4. **Bloques huérfanos si el primary muere a mitad de una subida.** La subida es
+   atómica a nivel de metadatos: una subida interrumpida nunca deja el archivo
+   visible (`ls`/`stat` no lo muestran). Pero los bloques que el primary ya había
+   escrito en los DataNodes quedan en disco, porque un proceso que recibe un kill
+   no ejecuta la limpieza del handler de subida. No afecta la correctitud (nadie
+   referencia esos bloques), solo consume espacio. La solución estándar es un
+   **recolector de basura por reporte de bloques** (el ControlNode pide a cada
+   DataNode su inventario y borra los no referenciados en `blocks`), igual que
+   HDFS. Como toca el DataNode, se considera parte de RF3; aquí se documenta como
+   limitación conocida.

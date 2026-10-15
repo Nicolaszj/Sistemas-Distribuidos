@@ -158,10 +158,35 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: R13_
   - _Commit: `docs(ha): README y documento de alta disponibilidad del ControlNode`_
 
-- [ ] 12. Verificación final e integración
-  - [ ] 12.1 Correr toda la suite `pytest -q` y arreglar regresiones.
-  - [ ] 12.2 Repaso manual de la demo según R11.2 (matar primary; ls/get/put).
-  - [ ] 12.3 Dejar la rama lista para Pull Request (sin push/merge hasta aprobación).
+- [x] 12. Verificación final e integración
+  - [x] 12.1 Suite completa `pytest -q`: 71 passed. Durante la verificación se
+    encontraron y corrigieron dos fallos de comportamiento (ventana de replicación
+    en la demo y fencing de un primary viejo que vuelve → `fix(ha)` reconcile).
+  - [x] 12.2 Demo end-to-end ejecutada (sin Docker: el engine local no tiene DNS
+    para bajar imágenes, así que se levantaron primary+standby+2 DataNodes como
+    procesos reales, mismo código y variables que el compose). 7/8 pasos OK: put,
+    ls, /ha/status, matar principal, promoción, ls/get/put en el nuevo principal,
+    y regreso del viejo como standby (fencing). En el paso de matar el primary en
+    medio de un put: el archivo NO queda visible a medias (subida atómica), pero sí
+    quedan bloques huérfanos en los DataNodes porque un proceso MATADO no ejecuta
+    su limpieza. Ver sección 12.4 (pendiente de decisión).
+  - [x] 12.3 Rama `feature/controlnode-ha` lista para PR, sin push ni merge.
+
+### 12.4 Hallazgo: bloques huérfanos tras matar el primary a mitad de subida
+
+La subida es atómica a nivel de metadatos: si el ControlNode cae a mitad de un
+`put`, el archivo nunca aparece en `files`, así que `ls`/`stat` no lo muestran a
+medias (verificado: `grande.bin visible=False`). Pero los bloques que el
+ControlNode ya había escrito en los DataNodes **quedan en disco** como huérfanos
+(verificado: 24 bloques sin fila en `blocks`). La limpieza del handler de subida
+(`except BaseException`) solo corre ante un error atrapado, no cuando el proceso
+recibe un kill.
+
+Esto es inherente a una caída dura y la solución estándar es un **recolector de
+basura por reporte de bloques** (como HDFS): el ControlNode pregunta a cada
+DataNode qué bloques tiene y manda borrar los no referenciados. Eso toca el
+DataNode (área de Abraham) y es, con propiedad, parte de RF3. Pendiente de decidir
+con el responsable si se añade un GC mínimo en esta rama o se difiere a RF3.
   - _Requisitos: R12, R11_
   - _Commit: `test(ha): suite completa de alta disponibilidad en verde`_
 
