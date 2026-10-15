@@ -661,3 +661,107 @@ def test_in_grace_controla_el_filtrado(tmp_path, monkeypatch):
     fresh.promote()
     assert fresh.in_grace() is True
     assert {row["id"] for row in main._available_data_nodes()} == {"viejo"}
+
+
+# --- Tarea 8: failover del DataNode entre ControlNodes --------------------------
+
+
+class _PostResult:
+    """requests.Response simulada: raise_for_status falla si status >= 400."""
+
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests as _requests
+
+            raise _requests.HTTPError(f"status {self.status_code}")
+
+
+def _run_datanode_loop(monkeypatch, control_urls, post_side_effect, cycles):
+    """Ejecuta _register_and_heartbeat durante `cycles` ciclos y devuelve la lista
+    de URLs base golpeadas por cada POST /nodes/register."""
+    from dfsha.server import config as config_module
+    from dfsha.server import datanode
+
+    monkeypatch.setattr(config_module, "CONTROL_URLS", control_urls)
+    monkeypatch.setattr(config_module, "NODE_ID", "dn-test")
+    monkeypatch.setattr(config_module, "DATANODE_URL", "http://dn-test:8000")
+
+    register_hits = []
+
+    def fake_post(url, **kwargs):
+        if "/nodes/register" in url:
+            base = url.split("/nodes/register")[0]
+            register_hits.append(base)
+            return post_side_effect(base)
+        return _PostResult(200)  # heartbeat
+
+    monkeypatch.setattr(datanode.requests, "post", fake_post)
+
+    # Controlar el número de ciclos: tras `cycles` esperas, parar el bucle.
+    datanode._stop.clear()
+    counter = {"n": 0}
+
+    def fake_wait(_seconds):
+        counter["n"] += 1
+        if counter["n"] >= cycles:
+            datanode._stop.set()
+
+    monkeypatch.setattr(datanode._stop, "wait", fake_wait)
+    try:
+        datanode._register_and_heartbeat()
+    finally:
+        datanode._stop.clear()
+    return register_hits
+
+
+def test_datanode_una_sola_url_como_antes(monkeypatch):
+    """Con una sola URL, cada ciclo golpea exactamente esa URL."""
+    hits = _run_datanode_loop(
+        monkeypatch,
+        ["http://control:8000"],
+        post_side_effect=lambda base: _PostResult(200),
+        cycles=3,
+    )
+    assert hits == ["http://control:8000"] * 3
+
+
+def test_datanode_salta_ante_503_not_primary(monkeypatch):
+    """Si la primera URL responde 503 (standby), el DataNode usa la segunda."""
+    def side_effect(base):
+        return _PostResult(503 if base == "http://a:8000" else 200)
+
+    hits = _run_datanode_loop(
+        monkeypatch, ["http://a:8000", "http://b:8000"], side_effect, cycles=1
+    )
+    # En el primer ciclo golpea 'a' (503) y luego 'b' (ok).
+    assert hits == ["http://a:8000", "http://b:8000"]
+
+
+def test_datanode_salta_ante_error_de_conexion(monkeypatch):
+    import requests
+
+    def side_effect(base):
+        if base == "http://a:8000":
+            raise requests.ConnectionError("sin conexión")
+        return _PostResult(200)
+
+    hits = _run_datanode_loop(
+        monkeypatch, ["http://a:8000", "http://b:8000"], side_effect, cycles=1
+    )
+    assert hits == ["http://a:8000", "http://b:8000"]
+
+
+def test_datanode_recuerda_el_segundo_y_no_regolpea_al_primero(monkeypatch):
+    """Tras fallar 'a' y funcionar 'b', los ciclos siguientes van directo a 'b'."""
+    def side_effect(base):
+        return _PostResult(503 if base == "http://a:8000" else 200)
+
+    hits = _run_datanode_loop(
+        monkeypatch, ["http://a:8000", "http://b:8000"], side_effect, cycles=3
+    )
+    # Ciclo 1: a (503), b (ok). Ciclos 2 y 3: directo a b, sin volver a 'a'.
+    assert hits == ["http://a:8000", "http://b:8000", "http://b:8000", "http://b:8000"]
+    assert hits.count("http://a:8000") == 1

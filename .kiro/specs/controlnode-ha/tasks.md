@@ -111,12 +111,13 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: R9_
   - _Commit: `feat(ha): periodo de gracia de DataNodes tras promoción`_
 
-- [ ] 8. Failover de DataNodes hacia el nuevo primary
-  - [ ] 8.1 En `datanode.py`, `_register_and_heartbeat` recorre `CONTROL_URLS`;
+- [x] 8. Failover de DataNodes hacia el nuevo primary
+  - [x] 8.1 En `datanode.py`, `_register_and_heartbeat` recorre `CONTROL_URLS`;
     ante error de conexión o 503 `not_primary`, prueba la siguiente y recuerda la
-    buena. Cambio contenido en esa función.
-  - [ ] 8.2 Prueba de unidad del fallback de URLs del DataNode (puede ir en
-    `test_distributed_units.py`).
+    buena. Cambio contenido en esa función (más un helper `_register_once`).
+  - [x] 8.2 Pruebas del fallback: una sola URL igual que antes, salto ante 503
+    not_primary, salto ante error de conexión, y persistencia del preferido sin
+    regolpear al primero cada ciclo.
   - _Requisitos: R8_
   - _Commit: `feat(ha): DataNode reintenta contra la lista de ControlNodes`_
 

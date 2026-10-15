@@ -93,32 +93,50 @@ def delete_block(
     return {"id": block_id, "removed": True}
 
 
-def _register_and_heartbeat():
-    if not config.CONTROL_URL or not config.NODE_ID or not config.DATANODE_URL:
-        return
+def _register_once(base_url, payload, verify):
+    """Registro + heartbeat contra un ControlNode. Devuelve True si tuvo éxito.
+    Un 503 not_primary (ese ControlNode es standby) cuenta como fallo para que el
+    hilo pruebe con el siguiente de la lista."""
     token = cluster_auth.issue_node_token(config.CLUSTER_SECRET, config.NODE_ID)
+    response = requests.post(
+        f"{base_url}/nodes/register",
+        json=payload,
+        headers={"X-Node-Token": token},
+        verify=verify,
+        timeout=5,
+    )
+    response.raise_for_status()
+    token = cluster_auth.issue_node_token(config.CLUSTER_SECRET, config.NODE_ID)
+    response = requests.post(
+        f"{base_url}/nodes/{config.NODE_ID}/heartbeat",
+        headers={"X-Node-Token": token},
+        verify=verify,
+        timeout=5,
+    )
+    response.raise_for_status()
+    return True
+
+
+def _register_and_heartbeat():
+    if not config.CONTROL_URLS or not config.NODE_ID or not config.DATANODE_URL:
+        return
     verify = os.getenv("DFSHA_CONTROL_CA") or True
     payload = {"node_id": config.NODE_ID, "url": config.DATANODE_URL}
+    # Preferir el último ControlNode que respondió como primary.
+    preferred = config.CONTROL_URLS[0]
     while not _stop.is_set():
-        try:
-            response = requests.post(
-                f"{config.CONTROL_URL}/nodes/register",
-                json=payload,
-                headers={"X-Node-Token": token},
-                verify=verify,
-                timeout=5,
-            )
-            response.raise_for_status()
-            token = cluster_auth.issue_node_token(config.CLUSTER_SECRET, config.NODE_ID)
-            response = requests.post(
-                f"{config.CONTROL_URL}/nodes/{config.NODE_ID}/heartbeat",
-                headers={"X-Node-Token": token},
-                verify=verify,
-                timeout=5,
-            )
-            response.raise_for_status()
-        except requests.RequestException as error:
-            print(f"ADVERTENCIA: heartbeat del DataNode falló: {error}")
+        # Ordenar la lista empezando por el preferido, luego el resto.
+        urls = [preferred] + [u for u in config.CONTROL_URLS if u != preferred]
+        for base_url in urls:
+            try:
+                if _register_once(base_url, payload, verify):
+                    preferred = base_url  # recordar el primary actual
+                    break
+            except requests.RequestException as error:
+                # Conexión caída o 503 not_primary (ese nodo es standby): probar
+                # el siguiente ControlNode de la lista.
+                print(f"ADVERTENCIA: ControlNode {base_url} no disponible: {error}")
+                continue
         _stop.wait(config.NODE_HEARTBEAT_SECONDS)
 
 
