@@ -1,0 +1,3 @@
+# Los scripts se ejecutan en Linux (CloudShell y las EC2): siempre con saltos LF.
+*.sh text eol=lf
+*.env text eol=lf

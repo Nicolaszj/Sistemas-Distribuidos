@@ -5,6 +5,7 @@ import os
 import shlex
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .. import paths
 from .api import DfsClient, DfsError, OtpRequired
@@ -215,7 +216,11 @@ class Shell:
         print(f"{plan['path']}  {plan['size']} bytes  bloque={plan['block_size']} bytes")
         for block in plan["blocks"]:
             checksum = (block.get("checksum") or "")[:12]
-            print(f"  [{block['sequence']}] {block['id']}  {block['size']} bytes  {checksum}")
+            node = urlparse(block.get("url", "")).netloc or "controlnode"
+            print(
+                f"  [{block['sequence']}] {block['id']}  {block['size']} bytes"
+                f"  {checksum}  en {node}"
+            )
 
     def do_stat(self, arguments):
         info = self.client.stat(self.resolve(arguments[0] if arguments else self.cwd))
