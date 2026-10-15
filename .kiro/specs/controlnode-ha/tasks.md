@@ -137,23 +137,24 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: R7_
   - _Commit: `feat(ha): cliente con lista de ControlNodes y reintento en failover`_
 
-- [ ] 10. Docker Compose de demostración (primary + standby)
-  - [ ] 10.1 Añadir servicios `controlnode-a` (primary) y `controlnode-b`
-    (standby) con `DFSHA_HA_*` (demo: heartbeat 2s, timeout 6s, gracia 30s) y los
-    tres secretos idénticos desde `.env` (`DFSHA_CLUSTER_SECRET`, `DFSHA_SECRET`,
-    `DFSHA_STORAGE_KEY`).
-  - [ ] 10.2 Apuntar los DataNodes a ambos ControlNodes vía `DFSHA_CONTROL_URLS`.
-  - [ ] 10.3 Comentar en el compose qué valores son solo de desarrollo.
+- [x] 10. Docker Compose de demostración (primary + standby)
+  - [x] 10.1 Servicios `controlnode-a` (primary) y `controlnode-b` (standby) con
+    `DFSHA_HA_*` (demo: heartbeat 2s, timeout 6s, gracia 30s) y los tres secretos
+    idénticos por entorno (`DFSHA_CLUSTER_SECRET`, `DFSHA_SECRET`,
+    `DFSHA_STORAGE_KEY`) vía ancla YAML, con override desde `.env`.
+  - [x] 10.2 DataNodes (2) apuntan a ambos ControlNodes vía `DFSHA_CONTROL_URLS`;
+    volúmenes separados por nodo.
+  - [x] 10.3 Comentarios en el compose sobre qué valores son solo de desarrollo.
   - _Requisitos: R11, ajuste 1, ajuste 4_
   - _Commit: `feat(ha): docker-compose con ControlNode primary + standby`_
 
-- [ ] 11. Documentación
-  - [ ] 11.1 Actualizar `README.md`: variables `DFSHA_HA_*` y `DFSHA_CONTROL_URLS`,
+- [x] 11. Documentación
+  - [x] 11.1 README actualizado: variables `DFSHA_HA_*` y `DFSHA_CONTROL_URLS`,
     endpoints `/ha/*`, nota de secretos idénticos por entorno, y cómo correr la
     demo de failover.
-  - [ ] 11.2 Crear `docs/alta-disponibilidad-controlnode.md`: diseño elegido,
-    protocolos ControlNode↔ControlNode y cliente↔ControlNode, época/fencing,
-    ventana de pérdida y limitaciones conocidas.
+  - [x] 11.2 `docs/alta-disponibilidad-controlnode.md`: diseño, protocolos,
+    época/fencing, guion paso a paso de la demo y limitaciones (replicación
+    asíncrona, partición sin árbitro, bloques aún sin replicar → RF3).
   - _Requisitos: R13_
   - _Commit: `docs(ha): README y documento de alta disponibilidad del ControlNode`_
 
