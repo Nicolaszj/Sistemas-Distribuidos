@@ -2,9 +2,12 @@ import hashlib
 import secrets
 import sqlite3
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Optional
 
 import jwt
+import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
@@ -58,6 +61,47 @@ class RevokeRequest(BaseModel):
 class LockRequest(BaseModel):
     path: str
     ttl: Optional[int] = None
+
+
+class NodeRegistration(BaseModel):
+    node_id: str
+    url: str
+
+
+def _node_identity(node_id, token):
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta X-Node-Token")
+    try:
+        authenticated = cluster_auth.verify_node_token(config.CLUSTER_SECRET, token)
+    except cluster_auth.InvalidClusterToken as error:
+        raise HTTPException(status_code=403, detail=f"Token de nodo inválido: {error}")
+    if authenticated != node_id:
+        raise HTTPException(status_code=403, detail="El token no corresponde al nodo")
+
+
+@app.post("/nodes/register")
+def register_node(
+    registration: NodeRegistration,
+    token: Optional[str] = Header(None, alias="X-Node-Token"),
+):
+    _node_identity(registration.node_id, token)
+    if not registration.node_id or not registration.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Registro de nodo inválido")
+    with metadata.connect() as db:
+        metadata.register_node(db, registration.node_id, registration.url, time.time())
+    return {"node_id": registration.node_id, "status": "online"}
+
+
+@app.post("/nodes/{node_id}/heartbeat")
+def heartbeat_node(
+    node_id: str,
+    token: Optional[str] = Header(None, alias="X-Node-Token"),
+):
+    _node_identity(node_id, token)
+    with metadata.connect() as db:
+        if not metadata.heartbeat_node(db, node_id, time.time()):
+            raise HTTPException(status_code=404, detail="Nodo no registrado")
+    return {"node_id": node_id, "status": "online"}
 
 
 # --- Autenticación --------------------------------------------------------------
@@ -507,6 +551,78 @@ def unlock_file(request: PathRequest, user_id: int = Depends(current_user)):
 # --- Transferencia de archivos (RF2) -----------------------------------------------
 
 
+def _available_data_nodes():
+    with metadata.connect() as db:
+        nodes = metadata.available_nodes(
+            db, time.time(), config.NODE_TIMEOUT_SECONDS
+        )
+        if not nodes and config.DATANODES:
+            for index, url in enumerate(config.DATANODES):
+                metadata.register_node(
+                    db, f"static-{index}", url, time.time()
+                )
+            nodes = metadata.available_nodes(
+                db, time.time(), config.NODE_TIMEOUT_SECONDS
+            )
+        return nodes
+
+
+def _write_block_to_node(data, block_id, sequence=0):
+    nodes = _available_data_nodes()
+    if not nodes:
+        storage.write(data, block_id)
+        return None
+
+    start = sequence % len(nodes)
+    nodes = nodes[start:] + nodes[:start]
+
+    ticket = cluster_auth.issue_block_ticket(
+        config.CLUSTER_SECRET,
+        block_id,
+        cluster_auth.WRITE,
+        config.BLOCK_TICKET_TTL_SECONDS,
+    )
+    verify = config.NODE_CA
+    for node in nodes:
+        try:
+            response = requests.put(
+                f"{node['url']}/blocks/{block_id}",
+                data=data,
+                headers={"X-Block-Ticket": ticket},
+                verify=verify,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return node["id"]
+        except requests.RequestException:
+            continue
+    raise HTTPException(status_code=503, detail="Ningún DataNode pudo guardar el bloque")
+
+
+def _remove_block_from_node(block_id, node_id):
+    if not node_id:
+        storage.remove(block_id)
+        return
+    with metadata.connect() as db:
+        node = db.execute("SELECT url FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    if node is None:
+        return
+    ticket = cluster_auth.issue_block_ticket(
+        config.CLUSTER_SECRET, block_id, cluster_auth.WRITE,
+        config.BLOCK_TICKET_TTL_SECONDS,
+    )
+    try:
+        response = requests.delete(
+            f"{node['url']}/blocks/{block_id}",
+            headers={"X-Block-Ticket": ticket},
+            verify=config.NODE_CA,
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        print(f"ADVERTENCIA: no se pudo limpiar el bloque {block_id} en {node_id}")
+
+
 @app.post("/files/upload", status_code=201)
 async def upload_file(
     path: str,
@@ -532,24 +648,47 @@ async def upload_file(
     written = []
     file_hash = hashlib.sha256()
 
-    def store(block):
+    locations = {}
+    pending = []
+
+    def stage(block):
         file_hash.update(block)
         checksum = hashlib.sha256(block).hexdigest()
-        written.append((storage.write(block), len(block), checksum))
+        block_id = uuid.uuid4().hex
+        pending.append((block, block_id, len(block), checksum))
 
     try:
         buffer = bytearray()
         async for chunk in request.stream():
             buffer.extend(chunk)
             while len(buffer) >= config.BLOCK_SIZE:
-                store(bytes(buffer[: config.BLOCK_SIZE]))
+                stage(bytes(buffer[: config.BLOCK_SIZE]))
                 del buffer[: config.BLOCK_SIZE]
         if buffer:
-            store(bytes(buffer))
+            stage(bytes(buffer))
+
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(pending) or 1))) as executor:
+            node_ids = list(
+                executor.map(
+                    lambda indexed_item: _write_block_to_node(
+                        indexed_item[1][0],
+                        indexed_item[1][1],
+                        indexed_item[0],
+                    ),
+                    enumerate(pending),
+                )
+            )
+        written = [
+            (item[1], item[2], item[3]) for item in pending
+        ]
+        locations.update(
+            {item[1]: node_id for item, node_id in zip(pending, node_ids) if node_id}
+        )
 
         size = sum(block_size for _, block_size, _ in written)
         checksum = file_hash.hexdigest()
         old_blocks = []
+        old_locations = {}
         with metadata.connect() as db:
             check_lock(db, access.Target(where.owner_id, file_path, path), user_id)
             current = metadata.resolve_file(db, where.owner_id, file_path)
@@ -558,17 +697,26 @@ async def upload_file(
                     db, where.owner_id, directory_id, name, size, written, checksum
                 )
             elif overwrite:
+                old_locations = {
+                    row["id"]: row["id"]
+                    for row in metadata.file_blocks(db, current["id"])
+                }
+                for block_id in old_locations:
+                    location = metadata.block_location(db, block_id)
+                    old_locations[block_id] = location["id"] if location else None
                 old_blocks = metadata.replace_file(db, current["id"], size, written, checksum)
             else:
                 raise HTTPException(status_code=409, detail=f"Ya existe el archivo {path}")
+            for block_id, node_id in locations.items():
+                metadata.set_block_location(db, block_id, node_id)
     except BaseException:
         # Una subida fallida no deja bloques huérfanos ni un archivo a medias.
         for block_id, _, _ in written:
-            storage.remove(block_id)
+            _remove_block_from_node(block_id, locations.get(block_id))
         raise
 
     for block_id in old_blocks:
-        storage.remove(block_id)
+        _remove_block_from_node(block_id, old_locations.get(block_id))
 
     return {
         "path": paths.normalize(path),
@@ -583,11 +731,38 @@ async def upload_file(
 def download_file(path: str, user_id: int = Depends(current_user)):
     with metadata.connect() as db:
         _, file = access.file(db, user_id, path)
-        block_ids = [row["id"] for row in metadata.file_blocks(db, file["id"])]
+        block_rows = metadata.file_blocks(db, file["id"])
+        locations = {
+            row["id"]: metadata.block_location(db, row["id"]) for row in block_rows
+        }
 
     def blocks():
-        for block_id in block_ids:
-            yield storage.read(block_id)
+        for row in block_rows:
+            location = locations[row["id"]]
+            if location:
+                ticket = cluster_auth.issue_block_ticket(
+                    config.CLUSTER_SECRET,
+                    row["id"],
+                    cluster_auth.READ,
+                    config.BLOCK_TICKET_TTL_SECONDS,
+                    user_id,
+                )
+                try:
+                    response = requests.get(
+                        f"{location['url']}/blocks/{row['id']}",
+                        headers={"X-Block-Ticket": ticket},
+                        verify=config.NODE_CA,
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    yield response.content
+                    continue
+                except requests.RequestException as error:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"No se pudo descargar el bloque {row['id']}: {error}",
+                    )
+            yield storage.read(row["id"])
 
     return StreamingResponse(
         blocks(),
@@ -603,6 +778,9 @@ def list_file_blocks(path: str, user_id: int = Depends(current_user)):
     with metadata.connect() as db:
         where, file = access.file(db, user_id, path)
         rows = metadata.file_blocks(db, file["id"])
+        locations = {
+            row["id"]: metadata.block_location(db, row["id"]) for row in rows
+        }
 
     return {
         "path": where.display,
@@ -615,7 +793,11 @@ def list_file_blocks(path: str, user_id: int = Depends(current_user)):
                 "sequence": row["sequence"],
                 "size": row["size"],
                 "checksum": row["checksum"],
-                "url": f"/blocks/{row['id']}",
+                "url": (
+                    f"{location['url']}/blocks/{row['id']}"
+                    if (location := locations[row["id"]]) is not None
+                    else f"/blocks/{row['id']}"
+                ),
                 "ticket": cluster_auth.issue_block_ticket(
                     config.CLUSTER_SECRET,
                     row["id"],

@@ -1,4 +1,6 @@
 import hashlib
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -151,6 +153,13 @@ class DfsClient:
             if hashlib.sha256(data).hexdigest() != block["checksum"]:
                 raise IntegrityError(f"El bloque {block['id']} no coincide con su checksum")
         return data
+
+    def read_blocks_parallel(self, blocks, max_workers=None):
+        """Descarga bloques independientes en paralelo y conserva su orden."""
+        workers = max_workers or int(os.getenv("DFSHA_CLIENT_WORKERS", "8"))
+        workers = max(1, min(workers, len(blocks) or 1))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(self.read_block, blocks))
 
     def request(self, method, endpoint, extra_headers=None, **kwargs):
         headers = dict(extra_headers or {})

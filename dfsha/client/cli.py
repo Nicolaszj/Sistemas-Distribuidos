@@ -192,8 +192,7 @@ class Shell:
 
         digest = hashlib.sha256()
         with destination.open("wb") as output:
-            for block in plan["blocks"]:
-                data = self.client.read_block(block)
+            for data in self.client.read_blocks_parallel(plan["blocks"]):
                 digest.update(data)
                 output.write(data)
 
