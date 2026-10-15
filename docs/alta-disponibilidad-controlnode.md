@@ -243,3 +243,14 @@ docker compose down -v   # limpiar al terminar
    DataNode su inventario y borra los no referenciados en `blocks`), igual que
    HDFS. Como toca el DataNode, se considera parte de RF3; aquí se documenta como
    limitación conocida.
+
+5. **La reconciliación al arrancar depende de poder contactar al par.** El
+   mecanismo de fencing de un primary viejo que vuelve (`reconcile_on_start`, §5)
+   consulta `/ha/status` del par en el arranque. Si el par **no responde** en ese
+   momento (está caído, aún no levanta, o hay partición), el nodo arranca con el
+   **rol configurado** (`DFSHA_HA_ROLE`) y no se degrada. En consecuencia, si el
+   antiguo primary se reinicia mientras el nuevo primary está inalcanzable, ambos
+   podrían creerse primary hasta que se vuelvan a ver y la regla de época resuelva
+   el conflicto a favor de la época mayor. Es la misma clase de limitación que la
+   partición sin árbitro (punto 2): sin un tercer testigo no se puede garantizar un
+   único primary en el instante del arranque.
