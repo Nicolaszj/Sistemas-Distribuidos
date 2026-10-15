@@ -59,14 +59,52 @@ Los volúmenes gp3 de 16 GiB suman ≈ USD 6,40 al mes aunque las máquinas est�
 terminar el proyecto, `99-cleanup.sh --confirmar` borra instancias, Elastic IPs, Security
 Group y bucket.
 
-## 5. Evidencias
+## 5. Resultados de las pruebas en AWS (14-oct-2026)
+
+Clúster: cn1 `52.7.88.60`, cn2 `44.221.198.40`, dn1 `100.49.125.212`, dn2 `52.73.218.148`,
+dn3 `50.19.194.118`. Las pruebas de cliente se hicieron desde AWS CloudShell, fuera de la
+VPC de los nodos, hablando con ellos por Internet con TLS.
+
+| Prueba | Resultado |
+| --- | --- |
+| Subida de 50 MB | 13 bloques de 4 MiB repartidos en orden dn1 → dn2 → dn3 (5/4/4) |
+| Descarga | SHA-256 verificado por bloque y por archivo; `sha256sum` idéntico al original |
+| HTTP plano / HTTPS sin la CA / DataNode sin ticket | Conexión rechazada / certificado no confiable / 401 |
+| Bloque en disco | Marca `DFS1` + texto cifrado distinto de los bytes originales |
+| Caída de dn2 | El ControlNode deja de asignarle bloques a los 30 s; la subida siguiente va a dn1 y dn3; dn2 vuelve y se re-registra solo |
+| Replicación factor 3 | Al activarla, la re-replicación hizo 52 copias DataNode → DataNode (26 bloques × 2); cada DataNode quedó con los 26 bloques |
+| Lectura con 2 de 3 DataNodes caídos | Archivo de 50 MB descargado completo desde dn3, SHA-256 idéntico |
+| Caída del ControlNode primario | cn2 se promueve a `primary/1` en ~10 s; el cliente (lista cn1,cn2) sigue: `ls`, `get` verificado y `put` |
+| Regreso del primario viejo | cn1 vuelve como `standby/1` (fencing por época): nunca hay dos primarios |
+| Benchmark (CloudShell, misma región) | 32 MB: 0,242 s secuencial vs 0,241 s paralelo (1,01x); 128 MB: 0,945 s vs 0,811 s (1,17x) |
+
+Sobre el benchmark: dentro de la misma región la red da ~140 MB/s y el cuello de botella
+es el cliente (descifrar TLS y verificar SHA-256 en un solo equipo), por eso el paralelismo
+apenas mejora. La ganancia del paralelismo crece con la latencia entre cliente y DataNodes
+(por ejemplo, un cliente en Colombia contra us-east-1), porque varias descargas
+simultáneas ocultan el tiempo de ida y vuelta de cada bloque.
+
+## 6. Evidencias
 
 | Código | Evidencia |
 | --- | --- |
-| E02–E05 | Salida de `01-infra.sh`, instancias en 3 zonas, Security Group y Elastic IPs |
-| E06 | Certificados con las Elastic IP en el SAN |
-| E07 | `status.sh` con los 5 nodos OK por HTTPS |
-| E08–E09 | `put` de 50 MB repartido entre dn1, dn2 y dn3; `get` con SHA-256 verificado |
-| E10–E11 | HTTP plano rechazado, DataNode sin ticket rechazado, bloque cifrado en disco |
-| E12–E13 | Caída de dn2: el ControlNode deja de asignarle bloques; vuelve tras reiniciarlo |
-| E14 | Benchmark secuencial vs. paralelo desde el PC contra AWS |
+| E01 | Learner Lab activo y CloudShell en us-east-1 |
+| E02 | Salida de `01-infra.sh` con las 5 Elastic IPs |
+| E03 | Instancias en 3 zonas; Details con LabRole, IMDSv2 Required y sin key pair |
+| E04 | Security Group con una sola regla de entrada (8000/TCP) |
+| E05 | Elastic IPs asociadas |
+| E06 | Certificados de cada nodo con su Elastic IP en el SAN |
+| E07 | `03-deploy.sh` con los 5 nodos OK por HTTPS |
+| E08 | `put` de 50 MB: 13 bloques repartidos entre dn1, dn2 y dn3 |
+| E09 | `get` con SHA-256 verificado y hash idéntico |
+| E10 | Bloques guardados en el disco de cada DataNode |
+| E11 | HTTPS con CA: 200; HTTP plano y HTTPS sin CA: rechazados; DataNode sin ticket: 401 |
+| E12 | Bloque en disco cifrado frente a los bytes originales |
+| E13–E15 | Caída de dn2, nuevos bloques solo en dn1 y dn3, recuperación de dn2 |
+| E16 | Benchmark secuencial vs. paralelo (32 y 128 MB) |
+| E17 | Failover: cn1 caído, cn2 `primary/1`, el cliente sigue operando |
+| E18 | cn1 vuelve como `standby/1` |
+| E20 | ControlNodes `primary/0` y `standby/0` tras activar la HA |
+| E21 | Re-replicación: 52 copias DataNode → DataNode, 26 bloques en cada DataNode |
+| E22 | Lectura completa con dn1 y dn2 caídos |
+| E19 | Cleanup: sin instancias ni Elastic IPs de dfsha (después de sustentar) |
