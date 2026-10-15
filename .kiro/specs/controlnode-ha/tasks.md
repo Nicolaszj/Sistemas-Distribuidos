@@ -67,19 +67,19 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: ajuste 3 (R5.2)_
   - _Commit: `feat(ha): token de operador para /ha/promote`_
 
-- [ ] 5. Endpoints `/ha/*` y barrera `require_primary`
-  - [ ] 5.1 `GET /ha/status` (token de nodo): rol, epoch, applied_seq, peer_url,
+- [x] 5. Endpoints `/ha/*` y barrera `require_primary`
+  - [x] 5.1 `GET /ha/status` (token de nodo): rol, epoch, applied_seq, peer_url,
     peer_alive, grace_until, ts.
-  - [ ] 5.2 `GET /ha/oplog?after=&ack=` (token de nodo): entradas con seq>after,
+  - [x] 5.2 `GET /ha/oplog?after=&ack=` (token de nodo): entradas con seq>after,
     epoch del emisor y oldest_seq disponible; podar hasta `ack`. Solo responde si
     es primary; si el llamante trae epoch mayor, degradarse.
-  - [ ] 5.3 `GET /ha/snapshot` (token de nodo): `.db` por backup online como
+  - [x] 5.3 `GET /ha/snapshot` (token de nodo): `.db` por backup online como
     octet-stream.
-  - [ ] 5.4 `POST /ha/promote` (token de nodo + admin): promoción manual.
-  - [ ] 5.5 Barrera `require_primary`: cuando role=standby, responder 503
+  - [x] 5.4 `POST /ha/promote` (token de nodo + admin): promoción manual.
+  - [x] 5.5 Barrera `require_primary`: cuando role=standby, responder 503
     `{"error":"not_primary","primary_url":...}` a todo salvo lista blanca
     (`/ha`, `/health`, `/docs`, `/openapi.json`).
-  - [ ] 5.6 Pruebas: `test_standby_rechaza_cliente`, `test_promocion_manual`,
+  - [x] 5.6 Pruebas: `test_standby_rechaza_cliente`, `test_promocion_manual`,
     `test_ha_endpoints_requieren_auth`.
   - _Requisitos: R5.2, R6, R10, ajuste 3, D6_
   - _Commit: `feat(ha): endpoints /ha/* y rechazo 503 not_primary en standby`_

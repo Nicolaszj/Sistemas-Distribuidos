@@ -13,14 +13,36 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
+from fastapi.responses import JSONResponse
+
 from .. import cluster_auth, paths
-from . import access, auth, config, metadata, storage, totp
+from . import access, auth, config, ha, metadata, storage, totp
 
 app = FastAPI(title="DFSha", version="0.2.0")
 bearer = HTTPBearer(auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 metadata.initialize()
+# Carga el estado de HA persistido (rol, época, última secuencia aplicada).
+ha.state.load()
+
+# Rutas que un ControlNode en rol standby SÍ atiende (el resto se rechaza con 503
+# not_primary para que el cliente reintente contra el primary). La sincronización
+# y la depuración deben seguir disponibles aunque el nodo sea standby.
+_STANDBY_ALLOWED_PREFIXES = ("/ha", "/health", "/docs", "/openapi.json", "/redoc")
+
+
+@app.middleware("http")
+async def require_primary(request: Request, call_next):
+    """Barrera de rol: si el nodo actúa como standby, solo deja pasar los endpoints
+    de la lista blanca; cualquier otra petición de cliente recibe 503 not_primary."""
+    path = request.url.path
+    if not ha.state.is_primary and not path.startswith(_STANDBY_ALLOWED_PREFIXES):
+        return JSONResponse(
+            status_code=503,
+            content={"error": "not_primary", "primary_url": ha.state.peer_url or None},
+        )
+    return await call_next(request)
 
 
 class Credentials(BaseModel):
@@ -102,6 +124,99 @@ def heartbeat_node(
         if not metadata.heartbeat_node(db, node_id, time.time()):
             raise HTTPException(status_code=404, detail="Nodo no registrado")
     return {"node_id": node_id, "status": "online"}
+
+
+# --- Alta disponibilidad del ControlNode (/ha/*) --------------------------------
+
+
+def _require_node_token(token):
+    """Valida un token de nodo del clúster (firma con DFSHA_CLUSTER_SECRET)."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta X-Node-Token")
+    try:
+        return cluster_auth.verify_node_token(config.CLUSTER_SECRET, token)
+    except cluster_auth.InvalidClusterToken as error:
+        raise HTTPException(status_code=403, detail=f"Token de nodo inválido: {error}")
+
+
+def _require_admin_token(token):
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta X-Node-Token")
+    try:
+        return cluster_auth.verify_admin_token(config.CLUSTER_SECRET, token)
+    except cluster_auth.InvalidClusterToken as error:
+        raise HTTPException(status_code=403, detail=f"Token de operador inválido: {error}")
+
+
+@app.get("/ha/status")
+def ha_status(token: Optional[str] = Header(None, alias="X-Node-Token")):
+    """Estado de HA del nodo (rol, época, atraso de sync, par). Requiere token de
+    nodo: no revela secretos pero sí topología interna."""
+    _require_node_token(token)
+    return ha.state.status()
+
+
+@app.get("/ha/oplog")
+def ha_oplog(
+    after: int = 0,
+    ack: int = 0,
+    epoch: int = 0,
+    token: Optional[str] = Header(None, alias="X-Node-Token"),
+):
+    """Entrega al standby las entradas de oplog con seq > after. `ack` es la última
+    secuencia que el standby confirma haber aplicado (para podar). `epoch` es la
+    época del que pregunta: si es mayor que la nuestra, nos degradamos (fencing)."""
+    _require_node_token(token)
+
+    # Fencing: si el par trae una época mayor, este nodo quedó obsoleto.
+    if epoch > ha.state.epoch:
+        ha.state.demote(epoch)
+    if not ha.state.is_primary:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "not_primary", "epoch": ha.state.epoch},
+        )
+
+    with metadata.connect() as db:
+        if ack:
+            metadata.prune_oplog(db, ack)
+        rows = metadata.read_oplog(db, after)
+        low, high = metadata.oplog_bounds(db)
+    return {
+        "epoch": ha.state.epoch,
+        "oldest_seq": low,
+        "latest_seq": high,
+        "entries": [dict(row) for row in rows],
+    }
+
+
+@app.get("/ha/snapshot")
+def ha_snapshot(token: Optional[str] = Header(None, alias="X-Node-Token")):
+    """Snapshot binario consistente de la base para que el standby se ponga al día
+    desde cero. Incluye la última secuencia de oplog en una cabecera."""
+    _require_node_token(token)
+    if not ha.state.is_primary:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "not_primary", "epoch": ha.state.epoch},
+        )
+    with metadata.connect() as db:
+        _, high = metadata.oplog_bounds(db)
+    data = ha.snapshot_bytes()
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"X-DFSha-Oplog-Seq": str(high), "X-DFSha-Epoch": str(ha.state.epoch)},
+    )
+
+
+@app.post("/ha/promote")
+def ha_promote(token: Optional[str] = Header(None, alias="X-Node-Token")):
+    """Promoción manual asistida del standby. Operación de operador: exige el claim
+    admin además del token de nodo."""
+    _require_admin_token(token)
+    new_epoch = ha.state.promote()
+    return {"role": "primary", "epoch": new_epoch}
 
 
 # --- Autenticación --------------------------------------------------------------

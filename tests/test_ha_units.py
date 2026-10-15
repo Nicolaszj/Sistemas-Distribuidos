@@ -350,3 +350,97 @@ def test_admin_token_firma_mala_falla():
     token = cluster_auth.issue_admin_token("secreto-bueno")
     with pytest.raises(cluster_auth.InvalidClusterToken):
         cluster_auth.verify_admin_token("secreto-malo", token)
+
+
+# --- Tarea 5: endpoints /ha/* y barrera require_primary -------------------------
+
+
+def _node_token():
+    from dfsha import cluster_auth
+    from dfsha.server import config as config_module
+
+    return cluster_auth.issue_node_token(config_module.CLUSTER_SECRET, "peer")
+
+
+def _admin_token():
+    from dfsha import cluster_auth
+    from dfsha.server import config as config_module
+
+    return cluster_auth.issue_admin_token(config_module.CLUSTER_SECRET)
+
+
+def test_ha_endpoints_requieren_auth():
+    from fastapi.testclient import TestClient
+
+    from dfsha.server import main
+
+    with TestClient(main.app) as client:
+        # Sin token: todos los /ha/* rechazan.
+        assert client.get("/ha/status").status_code == 401
+        assert client.get("/ha/oplog").status_code == 401
+        assert client.get("/ha/snapshot").status_code == 401
+        assert client.post("/ha/promote").status_code == 401
+
+        # Token de nodo normal: status/oplog/snapshot ok, pero promote exige admin.
+        headers = {"X-Node-Token": _node_token()}
+        assert client.get("/ha/status", headers=headers).status_code == 200
+        assert client.post("/ha/promote", headers=headers).status_code == 403
+
+
+def test_ha_status_contenido():
+    from fastapi.testclient import TestClient
+
+    from dfsha.server import main
+
+    with TestClient(main.app) as client:
+        response = client.get("/ha/status", headers={"X-Node-Token": _node_token()})
+        body = response.json()
+        assert set(["role", "epoch", "applied_seq", "peer_url", "peer_alive",
+                    "grace_until", "ts"]).issubset(body.keys())
+
+
+def test_standby_rechaza_cliente_con_503(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from dfsha.server import ha, main
+
+    # Forzar rol standby en runtime.
+    monkeypatch.setattr(ha.state, "role", "standby")
+    monkeypatch.setattr(ha.state, "peer_url", "https://primary:8000")
+
+    with TestClient(main.app) as client:
+        # Petición de cliente normal: 503 not_primary con la URL del primary.
+        response = client.get("/fs/ls?path=/")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["error"] == "not_primary"
+        assert body["primary_url"] == "https://primary:8000"
+
+        # Los endpoints permitidos en standby siguen respondiendo (no 503).
+        assert client.get("/health").status_code != 503
+        assert client.get(
+            "/ha/status", headers={"X-Node-Token": _node_token()}
+        ).status_code == 200
+
+
+def test_promote_manual_sube_epoca(monkeypatch, tmp_path):
+    """POST /ha/promote con token admin promueve y devuelve la nueva época."""
+    from fastapi.testclient import TestClient
+
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, main, metadata
+
+    # Base aislada en modo standby para no tocar la global.
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "metadata.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    metadata.initialize()
+    fresh = ha.HaState().load()
+    monkeypatch.setattr(ha, "state", fresh)
+    monkeypatch.setattr(main, "ha", ha)
+
+    with TestClient(main.app) as client:
+        before = fresh.epoch
+        response = client.post("/ha/promote", headers={"X-Node-Token": _admin_token()})
+        assert response.status_code == 200
+        assert response.json()["epoch"] == before + 1
+        assert fresh.role == "primary"
