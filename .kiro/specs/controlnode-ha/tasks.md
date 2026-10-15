@@ -7,55 +7,55 @@ push ni merge sin aprobación.
 
 Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
 
-- [ ] 1. Configuración de HA y lista de ControlNodes (base, sin lógica aún)
-  - [ ] 1.1 Añadir en `config.py` las variables `DFSHA_HA_*` (ROLE, PEER_URL,
+- [x] 1. Configuración de HA y lista de ControlNodes (base, sin lógica aún)
+  - [x] 1.1 Añadir en `config.py` las variables `DFSHA_HA_*` (ROLE, PEER_URL,
     PEER_CA, HEARTBEAT_SECONDS=3, TIMEOUT_SECONDS=10, GRACE_SECONDS=30,
     OPLOG_RETENTION=10000) con sus defaults y validación de `DFSHA_HA_ROLE`
     (solo `primary`/`standby`, default `primary`; valor inválido ⇒ `ValueError`).
-  - [ ] 1.2 Derivar `CONTROL_URLS` a partir de `DFSHA_CONTROL_URLS` (lista por
+  - [x] 1.2 Derivar `CONTROL_URLS` a partir de `DFSHA_CONTROL_URLS` (lista por
     comas) o, si no está, de `DFSHA_CONTROL_URL` (una sola, retrocompatible);
     conservar `DFSHA_CONTROL_URL` intacta.
-  - [ ] 1.3 Prueba unitaria `test_control_urls_retrocompat` y una de validación de
+  - [x] 1.3 Prueba unitaria `test_control_urls_retrocompat` y una de validación de
     `DFSHA_HA_ROLE`.
   - _Requisitos: R1, R8.1_
   - _Commit: `feat(ha): configuración DFSHA_HA_* y lista de ControlNodes`_
 
-- [ ] 2. Esquema de oplog y estado de HA en SQLite
-  - [ ] 2.1 Añadir a `SCHEMA` en `metadata.py` las tablas `oplog` y `ha_state`
+- [x] 2. Esquema de oplog y estado de HA en SQLite
+  - [x] 2.1 Añadir a `SCHEMA` en `metadata.py` las tablas `oplog` y `ha_state`
     (fila única id=1, epoch, applied_seq, role) y crear la fila inicial en
     `initialize()` si no existe.
-  - [ ] 2.2 Implementar generador de triggers `install_oplog_triggers(db)` que, por
+  - [x] 2.2 Implementar generador de triggers `install_oplog_triggers(db)` que, por
     cada tabla replicada (users, directories, files, blocks, api_keys, groups,
     group_members, acl, locks, nodes, block_locations), cree los triggers
     AFTER INSERT/UPDATE/DELETE derivando columnas con `PRAGMA table_info`.
-  - [ ] 2.3 Caso especial `nodes`: el trigger de UPDATE lleva guarda
+  - [x] 2.3 Caso especial `nodes`: el trigger de UPDATE lleva guarda
     `WHEN NEW.url IS NOT OLD.url OR NEW.status IS NOT OLD.status` para no capturar
     los heartbeats (solo `last_heartbeat`). INSERT/DELETE sí se capturan.
-  - [ ] 2.4 Implementar `drop_oplog_triggers(db)`.
-  - [ ] 2.5 Helpers: `read_oplog(db, after, limit)`, `apply_oplog_entry(db, entry)`
+  - [x] 2.4 Implementar `drop_oplog_triggers(db)`.
+  - [x] 2.5 Helpers: `read_oplog(db, after, limit)`, `apply_oplog_entry(db, entry)`
     (INSERT OR REPLACE con payload / DELETE por pk, idempotente),
     `prune_oplog(db, upto)`, `get_ha_state(db)`, `set_ha_state(db, **cols)`.
-  - [ ] 2.6 En `initialize()`, instalar triggers solo si el rol inicial es
+  - [x] 2.6 En `initialize()`, instalar triggers solo si el rol inicial es
     `primary`; en `standby` no instalarlos (y dropearlos si existieran).
-  - [ ] 2.7 Pruebas: `test_oplog_captura_cambios` (seq creciente para I/U/D) y
+  - [x] 2.7 Pruebas: `test_oplog_captura_cambios` (seq creciente para I/U/D) y
     `test_heartbeat_no_genera_oplog`.
   - _Requisitos: R2, R2.4b, D8_
   - _Commit: `feat(ha): oplog por triggers de SQLite y tabla ha_state`_
 
-- [ ] 3. Módulo `dfsha/server/ha.py` (estado y operaciones, sin red todavía)
-  - [ ] 3.1 Estado en runtime (role, epoch, peer_url, promoted_at, last_peer_ok,
+- [x] 3. Módulo `dfsha/server/ha.py` (estado y operaciones, sin red todavía)
+  - [x] 3.1 Estado en runtime (role, epoch, peer_url, promoted_at, last_peer_ok,
     applied_seq) cargado/persistido desde `ha_state`.
-  - [ ] 3.2 `snapshot_bytes()` usando la API de backup online de SQLite
+  - [x] 3.2 `snapshot_bytes()` usando la API de backup online de SQLite
     (`sqlite3.Connection.backup`) para producir un `.db` consistente.
-  - [ ] 3.3 `load_snapshot(raw)`: reemplazar la base local por el snapshot y
+  - [x] 3.3 `load_snapshot(raw)`: reemplazar la base local por el snapshot y
     dejar `applied_seq`/epoch coherentes; dropear triggers tras cargar.
-  - [ ] 3.4 `apply_entries(entries)`: reaplicar en orden dentro de una transacción
+  - [x] 3.4 `apply_entries(entries)`: reaplicar en orden dentro de una transacción
     y avanzar `applied_seq`.
-  - [ ] 3.5 `promote()`: `epoch += 1`, role=primary, `install_oplog_triggers`,
+  - [x] 3.5 `promote()`: `epoch += 1`, role=primary, `install_oplog_triggers`,
     fijar `promoted_at=now()`, persistir estado.
-  - [ ] 3.6 `demote(new_epoch)`: role=standby, adoptar epoch, `drop_oplog_triggers`.
-  - [ ] 3.7 `grace_until` y helper `in_grace()` para R9.
-  - [ ] 3.8 Pruebas unitarias de promote/demote (cambios de epoch/role y presencia
+  - [x] 3.6 `demote(new_epoch)`: role=standby, adoptar epoch, `drop_oplog_triggers`.
+  - [x] 3.7 `grace_until` y helper `in_grace()` para R9.
+  - [x] 3.8 Pruebas unitarias de promote/demote (cambios de epoch/role y presencia
     de triggers).
   - _Requisitos: R3.1-3.3, R5.1-5.3, R9, ajuste 6_
   - _Commit: `feat(ha): módulo ha.py con snapshot, promoción y degradación`_

@@ -187,3 +187,137 @@ def test_apply_oplog_entry_idempotente(oplog_db):
         metadata.apply_oplog_entry(db, delete)
         count = db.execute("SELECT COUNT(*) AS n FROM users WHERE id = 1").fetchone()["n"]
     assert count == 0
+
+
+# --- R3 / R5 / R9: módulo ha.py (snapshot, promoción, degradación, gracia) ------
+
+
+def _triggers(metadata):
+    with metadata.connect() as db:
+        rows = db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            " AND name LIKE 'oplog_%'"
+        ).fetchall()
+    return {row["name"] for row in rows}
+
+
+def test_promote_sube_epoca_e_instala_triggers(tmp_path, monkeypatch):
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata
+
+    db_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", db_path)
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    metadata.initialize()  # arranca como standby: sin triggers
+    assert _triggers(metadata) == set()
+
+    state = ha.HaState().load()
+    assert state.role == "standby"
+    assert state.epoch == 0
+
+    new_epoch = state.promote()
+    assert new_epoch == 1
+    assert state.role == "primary"
+    # Al promoverse se instalan los triggers de captura.
+    assert len(_triggers(metadata)) == len(metadata.REPLICATED_TABLES) * 3
+
+    # El estado quedó persistido en ha_state.
+    reloaded = ha.HaState().load()
+    assert reloaded.role == "primary"
+    assert reloaded.epoch == 1
+
+
+def test_demote_adopta_epoca_mayor_y_quita_triggers(tmp_path, monkeypatch):
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata
+
+    db_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", db_path)
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()  # primary: con triggers
+    assert len(_triggers(metadata)) > 0
+
+    state = ha.HaState().load()
+    state.demote(new_epoch=5)
+    assert state.role == "standby"
+    assert state.epoch == 5
+    assert _triggers(metadata) == set()
+
+
+def test_grace_tras_promocion(tmp_path, monkeypatch):
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "metadata.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    monkeypatch.setattr(config_module, "HA_GRACE_SECONDS", 30)
+    metadata.initialize()
+
+    state = ha.HaState().load()
+    assert state.in_grace() is False  # aún no se promovió
+    state.promote()
+    assert state.in_grace() is True
+    # Pasado el periodo de gracia, deja de estar en gracia.
+    assert state.in_grace(now=state.promoted_at + 31) is False
+
+
+def test_snapshot_round_trip(tmp_path, monkeypatch):
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata
+
+    primary_path = tmp_path / "primary.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", primary_path)
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    with metadata.connect() as db:
+        metadata.create_user(db, "ana", "hash", "salt")
+
+    raw = ha.snapshot_bytes()
+    assert raw[:16].startswith(b"SQLite format 3")
+
+    # Cargar el snapshot en una base "standby" distinta.
+    standby_path = tmp_path / "standby.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", standby_path)
+    ha.load_snapshot(raw, applied_seq=7)
+
+    with metadata.connect() as db:
+        user = metadata.find_user(db, "ana")
+        ha_row = metadata.get_ha_state(db)
+    assert user is not None
+    assert ha_row["applied_seq"] == 7
+    assert ha_row["role"] == "standby"
+    # El standby no debe tener triggers de oplog tras cargar el snapshot.
+    assert _triggers(metadata) == set()
+
+
+def test_apply_entries_avanza_secuencia(tmp_path, monkeypatch):
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "metadata.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    metadata.initialize()
+
+    entries = [
+        {
+            "seq": 10,
+            "tbl": "users",
+            "op": "INSERT",
+            "pk": '{"id": 1}',
+            "payload": '{"id": 1, "username": "ana", "password_hash": "h",'
+            ' "salt": "s", "totp_secret": null, "totp_enabled": 0}',
+        },
+        {
+            "seq": 11,
+            "tbl": "users",
+            "op": "UPDATE",
+            "pk": '{"id": 1}',
+            "payload": '{"id": 1, "username": "ana2", "password_hash": "h",'
+            ' "salt": "s", "totp_secret": null, "totp_enabled": 0}',
+        },
+    ]
+    last = ha.apply_entries(entries)
+    assert last == 11
+    with metadata.connect() as db:
+        user = metadata.find_user(db, "ana2")
+    assert user is not None
