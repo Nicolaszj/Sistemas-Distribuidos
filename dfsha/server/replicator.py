@@ -99,12 +99,48 @@ def _loop(state):
         _stop.wait(config.HA_HEARTBEAT_SECONDS)
 
 
+def reconcile_on_start(state):
+    """Al arrancar, un primary con par consulta el estado del par. Si el par ya es
+    primary con una época >= a la propia, este nodo quedó obsoleto (p. ej. un
+    primary viejo que vuelve tras un failover) y se degrada a standby (fencing).
+    Devuelve True si tras reconciliar el nodo debe actuar como standby."""
+    if not state.peer_url:
+        return not state.is_primary
+    if not state.is_primary:
+        return True
+    # El nodo cree ser primary: verificar que el par no lo haya superado.
+    token = cluster_auth.issue_node_token(config.CLUSTER_SECRET, "controlnode")
+    try:
+        response = requests.get(
+            f"{state.peer_url}/ha/status",
+            headers={"X-Node-Token": token},
+            verify=config.HA_PEER_CA,
+            timeout=max(2, config.HA_HEARTBEAT_SECONDS),
+        )
+        response.raise_for_status()
+        peer = response.json()
+    except requests.RequestException:
+        return False  # el par no responde: seguimos como primary
+    if peer.get("role") == "primary" and peer.get("epoch", 0) >= state.epoch:
+        # El par es el primary legítimo (época mayor o igual pero ya activo).
+        state.demote(peer.get("epoch", state.epoch))
+        return True
+    return False
+
+
 def start(state=None):
-    """Arranca el hilo si el nodo es standby y tiene un par configurado."""
+    """Arranca el hilo de replicación si el nodo debe actuar como standby.
+
+    Un primary con par primero reconcilia: si descubre que el par ya es primary con
+    una época >= a la suya, se degrada (fencing de un primary viejo que vuelve) y
+    entonces sí arranca el replicador."""
     global _thread
     state = state or ha.state
-    if state.is_primary or not state.peer_url:
+    if not state.peer_url:
         return None
+    should_follow = reconcile_on_start(state)
+    if not should_follow:
+        return None  # sigue como primary legítimo
     _stop.clear()
     _thread = threading.Thread(
         target=_loop, args=(state,), name="dfsha-ha-replicator", daemon=True

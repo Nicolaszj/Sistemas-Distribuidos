@@ -920,3 +920,83 @@ def test_cliente_upload_no_reintenta_ante_409(monkeypatch):
         client.upload("/f", source)
     # Solo golpeó el primer ControlNode; no reintentó en el segundo ante 409.
     assert hits == ["http://a:8000/files/upload"]
+
+
+# --- Reconciliación al arrancar: primary viejo que vuelve se degrada ------------
+
+
+def test_reconcile_degrada_primary_viejo(tmp_path, monkeypatch):
+    """Un nodo que arranca como primary y descubre que el par ya es primary con
+    época mayor se degrada a standby (fencing del primary viejo que vuelve)."""
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata, replicator
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    state = ha.HaState().load()
+    state.peer_url = "https://peer:8000"
+    assert state.role == "primary" and state.epoch == 0
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"role": "primary", "epoch": 1}
+
+    monkeypatch.setattr(replicator.requests, "get", lambda *a, **k: _Resp())
+
+    should_follow = replicator.reconcile_on_start(state)
+    assert should_follow is True
+    assert state.role == "standby"
+    assert state.epoch == 1
+
+
+def test_reconcile_mantiene_primary_si_par_es_standby(tmp_path, monkeypatch):
+    """Si el par es standby, el primary legítimo sigue siendo primary."""
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata, replicator
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    state = ha.HaState().load()
+    state.peer_url = "https://peer:8000"
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"role": "standby", "epoch": 0}
+
+    monkeypatch.setattr(replicator.requests, "get", lambda *a, **k: _Resp())
+
+    assert replicator.reconcile_on_start(state) is False
+    assert state.role == "primary"
+
+
+def test_reconcile_mantiene_primary_si_par_no_responde(tmp_path, monkeypatch):
+    """Si el par no responde, el nodo sigue como primary (no se degrada a ciegas)."""
+    import requests
+
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata, replicator
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    state = ha.HaState().load()
+    state.peer_url = "https://peer:8000"
+
+    def boom(*a, **k):
+        raise requests.ConnectionError("sin conexión")
+
+    monkeypatch.setattr(replicator.requests, "get", boom)
+    assert replicator.reconcile_on_start(state) is False
+    assert state.role == "primary"
