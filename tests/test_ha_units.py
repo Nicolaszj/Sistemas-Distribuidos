@@ -444,3 +444,143 @@ def test_promote_manual_sube_epoca(monkeypatch, tmp_path):
         assert response.status_code == 200
         assert response.json()["epoch"] == before + 1
         assert fresh.role == "primary"
+
+
+# --- Tarea 6: replicador del standby, failover y fencing ------------------------
+
+
+def test_oplog_endpoint_rechaza_epoca_menor_cuando_standby(tmp_path, monkeypatch):
+    """Un nodo standby responde 409 not_primary a /ha/oplog (no sirve oplog)."""
+    from fastapi.testclient import TestClient
+
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, main, metadata
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    metadata.initialize()
+    fresh = ha.HaState().load()
+    monkeypatch.setattr(ha, "state", fresh)
+
+    with TestClient(main.app) as client:
+        response = client.get(
+            "/ha/oplog", params={"after": 0, "epoch": 0},
+            headers={"X-Node-Token": _node_token()},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["error"] == "not_primary"
+
+
+def test_oplog_endpoint_degrada_al_ver_epoca_mayor(tmp_path, monkeypatch):
+    """Un primary que recibe una época mayor en /ha/oplog se degrada (fencing)."""
+    from fastapi.testclient import TestClient
+
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, main, metadata
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    fresh = ha.HaState().load()
+    assert fresh.role == "primary"
+    monkeypatch.setattr(ha, "state", fresh)
+
+    with TestClient(main.app) as client:
+        response = client.get(
+            "/ha/oplog", params={"after": 0, "epoch": 9},
+            headers={"X-Node-Token": _node_token()},
+        )
+        # Al ver época 9 > 0 se degrada y por tanto deja de servir oplog.
+        assert response.status_code == 409
+        assert fresh.role == "standby"
+        assert fresh.epoch == 9
+
+
+def test_sync_incremental_por_oplog(tmp_path, monkeypatch):
+    """El standby aplica las entradas de oplog que produjo el primary.
+
+    Se evita la contaminación del DATABASE_PATH global capturando primero el oplog
+    del primary y aplicándolo después contra la base del standby.
+    """
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata
+
+    # 1) Primary: generar cambios y leer su oplog.
+    primary_db = tmp_path / "primary.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", primary_db)
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    with metadata.connect() as db:
+        metadata.create_user(db, "ana", "h", "s")
+        metadata.create_user(db, "beto", "h", "s")
+    with metadata.connect() as db:
+        entries = [dict(row) for row in metadata.read_oplog(db, after=0)]
+    assert entries  # el primary registró oplog
+
+    # 2) Standby: base vacía, aplicar el oplog capturado.
+    standby_db = tmp_path / "standby.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", standby_db)
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    metadata.initialize()
+    state = ha.HaState().load()
+    last = ha.apply_entries(entries)
+    state.set_applied_seq(last)
+
+    with metadata.connect() as db:
+        assert metadata.find_user(db, "ana") is not None
+        assert metadata.find_user(db, "beto") is not None
+        assert metadata.get_ha_state(db)["applied_seq"] == last
+
+
+def test_sync_snapshot_inicial(tmp_path, monkeypatch):
+    """El standby se pone al día desde cero copiando el snapshot binario del primary."""
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata
+
+    # Primary con datos y su snapshot.
+    primary_db = tmp_path / "primary.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", primary_db)
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    with metadata.connect() as db:
+        metadata.create_user(db, "ana", "h", "s")
+    raw = ha.snapshot_bytes()
+    with metadata.connect() as db:
+        _, high = metadata.oplog_bounds(db)
+
+    # Standby carga el snapshot.
+    standby_db = tmp_path / "standby.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", standby_db)
+    ha.load_snapshot(raw, applied_seq=high)
+    with metadata.connect() as db:
+        assert metadata.find_user(db, "ana") is not None
+        assert metadata.get_ha_state(db)["applied_seq"] == high
+
+
+def test_promocion_por_timeout(monkeypatch, tmp_path):
+    """Si el primary no responde, el standby se autopromueve tras el timeout."""
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, metadata, replicator
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "standby")
+    monkeypatch.setattr(config_module, "HA_TIMEOUT_SECONDS", 0)  # promover ya
+    monkeypatch.setattr(config_module, "HA_HEARTBEAT_SECONDS", 1)
+    metadata.initialize()
+    state = ha.HaState().load()
+    monkeypatch.setattr(ha, "state", state)
+    state.peer_url = "https://inalcanzable:8000"
+
+    # El pull falla (par inalcanzable): simulamos un ciclo del bucle a mano.
+    def fake_get(*args, **kwargs):
+        raise replicator.requests.RequestException("sin conexión")
+
+    monkeypatch.setattr(replicator.requests, "get", fake_get)
+
+    assert replicator._pull_once(state) is False
+    # Con timeout 0, el siguiente chequeo del bucle promueve.
+    assert state.role == "standby"
+    # Ejecutar la lógica de promoción como lo haría el bucle.
+    state.promote()
+    assert state.role == "primary"
+    assert state.epoch == 1

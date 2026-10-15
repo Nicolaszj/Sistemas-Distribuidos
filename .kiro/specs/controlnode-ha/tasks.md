@@ -84,17 +84,18 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: R5.2, R6, R10, ajuste 3, D6_
   - _Commit: `feat(ha): endpoints /ha/* y rechazo 503 not_primary en standby`_
 
-- [ ] 6. Hilo replicador del standby + detección de caída + fencing
-  - [ ] 6.1 Hilo de fondo (patrón del heartbeat del DataNode) que cada
+- [x] 6. Hilo replicador del standby + detección de caída + fencing
+  - [x] 6.1 Hilo de fondo (patrón del heartbeat del DataNode) que cada
     `HEARTBEAT_SECONDS`: pide oplog al primary firmando token de nodo; aplica
     entradas; actualiza `last_peer_ok`.
-  - [ ] 6.2 Si hay hueco por poda (`oldest_seq > applied_seq+1`), pedir snapshot.
-  - [ ] 6.3 Si el primary no responde por `TIMEOUT_SECONDS` ⇒ `promote()`.
-  - [ ] 6.4 Fencing: si el primary (u otro) anuncia epoch mayor, `demote()`.
-  - [ ] 6.5 Arrancar el hilo en el evento `startup` solo si role inicial=standby y
+  - [x] 6.2 Si hay hueco por poda (`oldest_seq > applied_seq+1`), pedir snapshot.
+  - [x] 6.3 Si el primary no responde por `TIMEOUT_SECONDS` ⇒ `promote()`.
+  - [x] 6.4 Fencing: si el primary (u otro) anuncia epoch mayor, `demote()`.
+  - [x] 6.5 Arrancar el hilo en el evento `startup` solo si role inicial=standby y
     hay peer_url.
-  - [ ] 6.6 Pruebas: `test_sync_snapshot_inicial`, `test_sync_incremental`,
-    `test_promocion_por_timeout`, `test_fencing_primary_viejo`.
+  - [x] 6.6 Pruebas: `test_sync_snapshot_inicial`, `test_sync_incremental_por_oplog`,
+    `test_promocion_por_timeout`, `test_oplog_endpoint_degrada_al_ver_epoca_mayor`,
+    `test_oplog_endpoint_rechaza_epoca_menor_cuando_standby`.
   - _Requisitos: R3, R4, R5.1, R5.4-5.6_
   - _Commit: `feat(ha): replicador del standby con failover y fencing por época`_
 

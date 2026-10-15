@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
 from .. import cluster_auth, paths
-from . import access, auth, config, ha, metadata, storage, totp
+from . import access, auth, config, ha, metadata, replicator, storage, totp
 
 app = FastAPI(title="DFSha", version="0.2.0")
 bearer = HTTPBearer(auto_error=False)
@@ -217,6 +217,18 @@ def ha_promote(token: Optional[str] = Header(None, alias="X-Node-Token")):
     _require_admin_token(token)
     new_epoch = ha.state.promote()
     return {"role": "primary", "epoch": new_epoch}
+
+
+@app.on_event("startup")
+def _start_replicator():
+    """Si el nodo arranca como standby con un par configurado, lanza el hilo que
+    replica el oplog y vigila al primary para el failover."""
+    replicator.start(ha.state)
+
+
+@app.on_event("shutdown")
+def _stop_replicator():
+    replicator.stop()
 
 
 # --- Autenticación --------------------------------------------------------------
