@@ -93,3 +93,97 @@ def test_ha_role_standby(monkeypatch, restore_config):
 def test_ha_role_invalido_falla(monkeypatch, restore_config):
     with pytest.raises(ValueError):
         _reload_config(monkeypatch, DFSHA_HA_ROLE="jefe")
+
+
+# --- R2 / D8: oplog por triggers de SQLite --------------------------------------
+
+
+@pytest.fixture
+def oplog_db(tmp_path, monkeypatch):
+    """Base de metadatos aislada en modo primary, con los triggers de oplog."""
+    from dfsha.server import config as config_module
+    from dfsha.server import metadata
+
+    db_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(config_module, "DATABASE_PATH", db_path)
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    metadata.initialize()
+    return metadata
+
+
+def _oplog_rows(metadata, **filters):
+    with metadata.connect() as db:
+        rows = db.execute("SELECT seq, tbl, op, pk, payload FROM oplog ORDER BY seq").fetchall()
+    if "tbl" in filters:
+        rows = [row for row in rows if row["tbl"] == filters["tbl"]]
+    return rows
+
+
+def test_oplog_captura_cambios(oplog_db):
+    metadata = oplog_db
+    with metadata.connect() as db:
+        user_id = metadata.create_user(db, "nico", "hash", "salt")
+
+    rows = _oplog_rows(metadata, tbl="users")
+    assert len(rows) == 1
+    assert rows[0]["op"] == "INSERT"
+
+    with metadata.connect() as db:
+        db.execute("UPDATE users SET salt = 'salt2' WHERE id = ?", (user_id,))
+    rows = _oplog_rows(metadata, tbl="users")
+    assert [row["op"] for row in rows] == ["INSERT", "UPDATE"]
+
+    with metadata.connect() as db:
+        # Borrar dependientes primero por las claves foráneas.
+        db.execute("DELETE FROM directories WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    rows = _oplog_rows(metadata, tbl="users")
+    assert rows[-1]["op"] == "DELETE"
+
+    # La secuencia es monótona creciente en todo el oplog.
+    all_rows = _oplog_rows(metadata)
+    seqs = [row["seq"] for row in all_rows]
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+
+
+def test_heartbeat_no_genera_oplog(oplog_db):
+    metadata = oplog_db
+    with metadata.connect() as db:
+        metadata.register_node(db, "dn1", "http://dn1:8000", 1000.0)
+    inserts = _oplog_rows(metadata, tbl="nodes")
+    assert len(inserts) == 1 and inserts[0]["op"] == "INSERT"
+
+    # Un heartbeat solo mueve last_heartbeat: no debe generar oplog (D8).
+    with metadata.connect() as db:
+        metadata.heartbeat_node(db, "dn1", 2000.0)
+    assert _oplog_rows(metadata, tbl="nodes") == inserts  # sin entradas nuevas
+
+    # Un cambio de url o status sí se registra.
+    with metadata.connect() as db:
+        db.execute("UPDATE nodes SET status = 'offline' WHERE id = 'dn1'")
+    rows = _oplog_rows(metadata, tbl="nodes")
+    assert [row["op"] for row in rows] == ["INSERT", "UPDATE"]
+
+
+def test_apply_oplog_entry_idempotente(oplog_db):
+    """Reaplicar la misma entrada deja la fila igual (INSERT OR REPLACE)."""
+    metadata = oplog_db
+    entry = {
+        "tbl": "users",
+        "op": "INSERT",
+        "pk": '{"id": 1}',
+        "payload": '{"id": 1, "username": "ana", "password_hash": "h",'
+        ' "salt": "s", "totp_secret": null, "totp_enabled": 0}',
+    }
+    with metadata.connect() as db:
+        metadata.apply_oplog_entry(db, entry)
+        metadata.apply_oplog_entry(db, entry)  # idempotente
+        count = db.execute("SELECT COUNT(*) AS n FROM users WHERE id = 1").fetchone()["n"]
+    assert count == 1
+
+    delete = {"tbl": "users", "op": "DELETE", "pk": '{"id": 1}', "payload": None}
+    with metadata.connect() as db:
+        metadata.apply_oplog_entry(db, delete)
+        count = db.execute("SELECT COUNT(*) AS n FROM users WHERE id = 1").fetchone()["n"]
+    assert count == 0
