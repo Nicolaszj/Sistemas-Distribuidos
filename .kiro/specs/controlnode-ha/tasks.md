@@ -121,14 +121,19 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: R8_
   - _Commit: `feat(ha): DataNode reintenta contra la lista de ControlNodes`_
 
-- [ ] 9. Failover transparente en el cliente
-  - [ ] 9.1 `DfsClient` acepta str o lista de URLs (`self.urls`), mantiene uso con
-    una sola URL.
-  - [ ] 9.2 En `request`, ante fallo de conexión/timeout o 503 `not_primary`,
-    reintentar contra las otras URLs; al acertar, fijarla como actual.
-  - [ ] 9.3 `cli.py`: aceptar varios `--server` o una lista separada por comas.
-  - [ ] 9.4 Verificar que el contrato `/files/blocks` → `/blocks/{id}` no cambia.
-  - [ ] 9.5 Prueba `test_cliente_failover`.
+- [x] 9. Failover transparente en el cliente
+  - [x] 9.1 `DfsClient` acepta str o lista de URLs (`self.urls`), mantiene uso con
+    una sola URL (y str con comas).
+  - [x] 9.2 En `request`, ante fallo de conexión/timeout o 503 `not_primary`,
+    reintentar contra las otras URLs; al acertar, fijarla como actual. `upload`
+    reintenta solo ante esos casos y rebobina el origen para no dejar subidas a
+    medias; otros errores (409, 423) no se reintentan.
+  - [x] 9.3 `cli.py`: `--server` acepta una lista separada por comas.
+  - [x] 9.4 El contrato `/files/blocks` → `/blocks/{id}` no cambia (las URLs
+    absolutas de bloque van directas, sin failover de ControlNode).
+  - [x] 9.5 Pruebas: failover de GET ante 503 y ante error de conexión, memoria del
+    nodo actual, todas-fallan, upload con rebobinado, y upload que no reintenta
+    ante 409.
   - _Requisitos: R7_
   - _Commit: `feat(ha): cliente con lista de ControlNodes y reintento en failover`_
 

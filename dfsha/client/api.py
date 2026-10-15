@@ -17,11 +17,50 @@ class IntegrityError(DfsError):
     pass
 
 
+class _Retryable(Exception):
+    """Fallo de conexión/timeout que permite reintentar en otro ControlNode."""
+
+    def __init__(self, cause):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+def _normalize_urls(base_url):
+    """Admite una str (con una o varias URLs separadas por comas) o una lista."""
+    if isinstance(base_url, (list, tuple)):
+        raw = base_url
+    else:
+        raw = str(base_url).split(",")
+    urls = []
+    for item in raw:
+        cleaned = item.strip().rstrip("/")
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+    if not urls:
+        raise DfsError("Se requiere al menos una URL de ControlNode")
+    return urls
+
+
+def _is_not_primary(response):
+    """True si la respuesta es el 503 {"error":"not_primary"} de un standby."""
+    if response.status_code != 503:
+        return False
+    try:
+        return response.json().get("error") == "not_primary"
+    except ValueError:
+        return False
+
+
 class DfsClient:
     def __init__(self, base_url, ca_file=None, api_key=None):
-        """`ca_file`: certificado de la CA del clúster para validar TLS (https).
+        """`base_url`: URL del ControlNode, o una lista de URLs (primary + standby)
+        para alta disponibilidad. También admite una sola cadena con URLs separadas
+        por comas. Con una sola URL se comporta igual que antes.
+        `ca_file`: certificado de la CA del clúster para validar TLS (https).
         `api_key`: alternativa a usuario/contraseña para scripts y automatización."""
-        self.base_url = base_url.rstrip("/")
+        self.urls = _normalize_urls(base_url)
+        # URL del ControlNode que se usa ahora; se mueve al que responda como primary.
+        self.base_url = self.urls[0]
         self.session = requests.Session()
         # Se pasa en cada petición: requests ignora session.verify si existe la
         # variable de entorno REQUESTS_CA_BUNDLE.
@@ -124,10 +163,57 @@ class DfsClient:
     # --- transferencia ---------------------------------------------------------------
 
     def upload(self, path, source, overwrite=False):
+        """Sube un archivo con failover seguro entre ControlNodes.
+
+        Solo se reintenta ante error de conexión o 503 not_primary (el standby no
+        procesó nada). Para poder reintentar sin corromper el archivo, el origen se
+        rebobina al inicio antes de cada intento; si el origen no es rebobinable
+        (p. ej. una tubería), se lee entero en memoria una vez. El servidor, por su
+        parte, no deja un archivo a medias ni bloques huérfanos si una subida se
+        interrumpe (subida atómica), así que un reintento no acumula basura."""
         params = {"path": path}
         if overwrite:
             params["overwrite"] = "true"
-        return self.request("POST", "/files/upload", params=params, data=source).json()
+
+        rewind = getattr(source, "seek", None)
+        start = source.tell() if callable(getattr(source, "tell", None)) else None
+        if rewind is None or start is None:
+            # Origen no rebobinable: materializarlo para poder reintentar.
+            body = source.read() if hasattr(source, "read") else source
+            source = None
+        else:
+            body = None
+
+        candidates = [self.base_url] + [u for u in self.urls if u != self.base_url]
+        last_error = None
+        for base in candidates:
+            if source is not None:
+                source.seek(start)  # rebobinar para re-enviar el archivo completo
+            data = source if source is not None else body
+            headers = {}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            elif self.api_key:
+                headers["X-API-Key"] = self.api_key
+            try:
+                response = self._send(
+                    "POST", f"{base}/files/upload", headers,
+                    {"params": params, "data": data},
+                )
+            except _Retryable as error:
+                last_error = error.cause
+                continue
+            if _is_not_primary(response):
+                last_error = DfsError("El ControlNode respondió 'no soy el primary'")
+                continue
+            self.base_url = base
+            if not response.ok:
+                raise DfsError(describe_error(response))
+            return response.json()
+
+        raise DfsError(
+            f"Ningún ControlNode acepto la subida ({', '.join(self.urls)}): {last_error}"
+        )
 
     def blocks(self, path):
         return self.request("GET", "/files/blocks", params={"path": path}).json()
@@ -161,29 +247,78 @@ class DfsClient:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             return list(executor.map(self.read_block, blocks))
 
-    def request(self, method, endpoint, extra_headers=None, **kwargs):
+    def request(self, method, endpoint, extra_headers=None, safe=True, **kwargs):
+        """Realiza una petición con failover entre ControlNodes.
+
+        `safe`: True para operaciones idempotentes/de solo lectura (ls, stat, get,
+        blocks). Ante un ControlNode que no responde o que contesta 503 not_primary,
+        el cliente reintenta automáticamente contra las otras URLs.
+
+        Las operaciones de escritura (upload, mkdir, rm, lock, ...) pasan safe=True
+        también porque el único reintento permitido es ante error de conexión o 503
+        not_primary (el ControlNode ni siquiera llegó a procesar la escritura, o es
+        un standby). No se reintenta ante otros errores (p. ej. 409, 423) para no
+        repetir una operación que sí se evaluó. La protección contra subidas a
+        medias vive en `upload` (reposiciona el origen y el servidor limpia bloques
+        huérfanos si una subida falla)."""
         headers = dict(extra_headers or {})
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         elif self.api_key:
             headers["X-API-Key"] = self.api_key
 
-        url = endpoint if endpoint.startswith("http") else self.base_url + endpoint
+        # Si el endpoint es una URL absoluta (p. ej. la URL de un bloque en un
+        # DataNode), no se aplica failover de ControlNode: va directa.
+        if endpoint.startswith("http"):
+            try:
+                response = self._send(method, endpoint, headers, kwargs)
+            except _Retryable as error:
+                raise DfsError(f"No hay conexión con el servidor: {error.cause}")
+            if response.status_code == 401 and response.headers.get("X-DFSha-OTP") == "required":
+                raise OtpRequired(describe_error(response))
+            if not response.ok:
+                raise DfsError(describe_error(response))
+            return response
+
+        # Orden de intento: el ControlNode actual primero, luego el resto.
+        candidates = [self.base_url] + [u for u in self.urls if u != self.base_url]
+        last_error = None
+        for base in candidates:
+            try:
+                response = self._send(method, base + endpoint, headers, kwargs)
+            except _Retryable as error:
+                last_error = error.cause
+                continue  # ese ControlNode no respondió: probar el siguiente
+
+            # 503 not_primary: ese nodo es standby, reintentar en otro.
+            if _is_not_primary(response):
+                last_error = DfsError("El ControlNode respondió 'no soy el primary'")
+                continue
+
+            # Respuesta válida de un primary: fijarlo como actual y devolver.
+            self.base_url = base
+            if response.status_code == 401 and response.headers.get("X-DFSha-OTP") == "required":
+                raise OtpRequired(describe_error(response))
+            if not response.ok:
+                raise DfsError(describe_error(response))
+            return response
+
+        raise DfsError(
+            f"Ningún ControlNode respondió ({', '.join(self.urls)}): {last_error}"
+        )
+
+    def _send(self, method, url, headers, kwargs):
+        """Una sola petición HTTP. Traduce fallos de conexión en _Retryable para que
+        el failover pueda probar con otro ControlNode."""
         try:
-            response = self.session.request(
+            return self.session.request(
                 method, url, headers=headers, verify=self.verify, **kwargs
             )
         except requests.exceptions.SSLError as error:
+            # Un error TLS no es de disponibilidad: no tiene sentido reintentar.
             raise DfsError(f"Error TLS (¿falta --ca con el certificado de la CA?): {error}")
         except requests.RequestException as error:
-            raise DfsError(f"No hay conexión con el servidor: {error}")
-
-        if response.status_code == 401 and response.headers.get("X-DFSha-OTP") == "required":
-            raise OtpRequired(describe_error(response))
-        if not response.ok:
-            raise DfsError(describe_error(response))
-
-        return response
+            raise _Retryable(error)
 
 
 def describe_error(response):

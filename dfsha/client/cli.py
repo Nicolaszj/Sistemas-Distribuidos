@@ -388,7 +388,12 @@ def print_qr(uri):
 
 def main():
     parser = argparse.ArgumentParser(description="Cliente CLI de DFSha")
-    parser.add_argument("--server", default=os.getenv("DFSHA_SERVER", "http://localhost:8000"))
+    parser.add_argument(
+        "--server",
+        default=os.getenv("DFSHA_SERVER", "http://localhost:8000"),
+        help="URL del ControlNode; para alta disponibilidad, varias separadas por"
+        " comas (primary,standby). El cliente reintenta con la otra si una no responde",
+    )
     parser.add_argument("--user", help="usuario (no hace falta con --api-key)")
     parser.add_argument("--register", action="store_true", help="crea el usuario antes de entrar")
     parser.add_argument("--ca", default=os.getenv("DFSHA_CA"), help="certificado de la CA para https")
@@ -416,7 +421,7 @@ def main():
         print(error)
         return 1
 
-    print(f"Conectado a {arguments.server} como {name}. Escribe help.")
+    print(f"Conectado a {client.base_url} como {name}. Escribe help.")
     Shell(client).run()
     return 0
 

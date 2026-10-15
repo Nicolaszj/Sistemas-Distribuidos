@@ -765,3 +765,158 @@ def test_datanode_recuerda_el_segundo_y_no_regolpea_al_primero(monkeypatch):
     # Ciclo 1: a (503), b (ok). Ciclos 2 y 3: directo a b, sin volver a 'a'.
     assert hits == ["http://a:8000", "http://b:8000", "http://b:8000", "http://b:8000"]
     assert hits.count("http://a:8000") == 1
+
+
+# --- Tarea 9: failover transparente en el cliente ------------------------------
+
+
+class _ClientResponse:
+    """requests.Response simulada para el cliente."""
+
+    def __init__(self, status_code=200, body=None, content=b"", headers=None):
+        self.status_code = status_code
+        self._body = body if body is not None else {}
+        self.content = content
+        self.headers = headers or {}
+
+    @property
+    def ok(self):
+        return self.status_code < 400
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self):
+        if not self.ok:
+            import requests as _requests
+
+            raise _requests.HTTPError(f"status {self.status_code}")
+
+
+def _not_primary_response():
+    return _ClientResponse(503, {"error": "not_primary", "primary_url": None})
+
+
+def _make_client(urls):
+    from dfsha.client.api import DfsClient
+
+    return DfsClient(urls)
+
+
+def test_cliente_una_sola_url_como_antes():
+    client = _make_client("http://solo:8000")
+    assert client.urls == ["http://solo:8000"]
+    assert client.base_url == "http://solo:8000"
+
+
+def test_cliente_lista_desde_string_con_comas():
+    client = _make_client("http://a:8000, http://b:8000/")
+    assert client.urls == ["http://a:8000", "http://b:8000"]
+
+
+def test_cliente_failover_get_ante_503(monkeypatch):
+    """Un GET al primario que responde 503 not_primary se reintenta en el standby."""
+    client = _make_client(["http://a:8000", "http://b:8000"])
+
+    def fake_request(method, url, headers=None, verify=None, **kwargs):
+        if url.startswith("http://a:8000"):
+            return _not_primary_response()
+        return _ClientResponse(200, {"path": "/", "entries": []})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    result = client.ls("/")
+    assert result == {"path": "/", "entries": []}
+    # Tras el failover, el cliente recuerda 'b' como actual.
+    assert client.base_url == "http://b:8000"
+
+
+def test_cliente_failover_get_ante_error_de_conexion(monkeypatch):
+    import requests
+
+    client = _make_client(["http://a:8000", "http://b:8000"])
+
+    def fake_request(method, url, headers=None, verify=None, **kwargs):
+        if url.startswith("http://a:8000"):
+            raise requests.ConnectionError("sin conexión")
+        return _ClientResponse(200, {"type": "dir"})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    assert client.stat("/x") == {"type": "dir"}
+    assert client.base_url == "http://b:8000"
+
+
+def test_cliente_recuerda_el_actual_entre_peticiones(monkeypatch):
+    client = _make_client(["http://a:8000", "http://b:8000"])
+    hits = []
+
+    def fake_request(method, url, headers=None, verify=None, **kwargs):
+        hits.append(url)
+        if url.startswith("http://a:8000"):
+            return _not_primary_response()
+        return _ClientResponse(200, {"ok": True})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    client.ls("/")  # failover a 'b'
+    hits.clear()
+    client.ls("/")  # ya debería ir directo a 'b'
+    assert all(url.startswith("http://b:8000") for url in hits)
+
+
+def test_cliente_todas_las_urls_fallan(monkeypatch):
+    import requests
+
+    from dfsha.client.api import DfsError
+
+    client = _make_client(["http://a:8000", "http://b:8000"])
+
+    def fake_request(method, url, headers=None, verify=None, **kwargs):
+        raise requests.ConnectionError("caído")
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    with pytest.raises(DfsError):
+        client.ls("/")
+
+
+def test_cliente_upload_failover_rebobina_origen(monkeypatch):
+    """put reintenta ante 503 not_primary y re-envía el archivo completo."""
+    import io
+
+    client = _make_client(["http://a:8000", "http://b:8000"])
+    source = io.BytesIO(b"contenido completo del archivo")
+    bodies = []
+
+    def fake_request(method, url, headers=None, verify=None, **kwargs):
+        data = kwargs.get("data")
+        payload = data.read() if hasattr(data, "read") else data
+        bodies.append((url, payload))
+        if url.startswith("http://a:8000"):
+            return _not_primary_response()
+        return _ClientResponse(201, {"path": "/f", "size": len(payload), "blocks": 1})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    result = client.upload("/f", source)
+    assert result["size"] == len(b"contenido completo del archivo")
+    # El segundo intento (a 'b') recibió el archivo completo, no un resto.
+    assert bodies[-1][1] == b"contenido completo del archivo"
+    assert client.base_url == "http://b:8000"
+
+
+def test_cliente_upload_no_reintenta_ante_409(monkeypatch):
+    """Un 409 (ya existe) no se reintenta: el servidor sí evaluó la operación."""
+    import io
+
+    from dfsha.client.api import DfsError
+
+    client = _make_client(["http://a:8000", "http://b:8000"])
+    source = io.BytesIO(b"datos")
+    hits = []
+
+    def fake_request(method, url, headers=None, verify=None, **kwargs):
+        hits.append(url)
+        return _ClientResponse(409, {"detail": "Ya existe el archivo /f"})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    with pytest.raises(DfsError):
+        client.upload("/f", source)
+    # Solo golpeó el primer ControlNode; no reintentó en el segundo ante 409.
+    assert hits == ["http://a:8000/files/upload"]
