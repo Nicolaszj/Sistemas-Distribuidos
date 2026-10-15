@@ -531,7 +531,21 @@ def heartbeat_node(db, node_id, heartbeat):
     return cursor.rowcount > 0
 
 
-def available_nodes(db, now_timestamp, timeout):
+def available_nodes(db, now_timestamp, timeout, grace=False):
+    """DataNodes considerados vivos.
+
+    Comportamiento normal (grace=False): online y con heartbeat dentro de la
+    ventana de timeout, idéntico a antes del hito 3.
+
+    Durante el periodo de gracia tras una promoción (grace=True) no se filtra por
+    la antigüedad del heartbeat: el `last_heartbeat` replicado quedó viejo tras el
+    failover y aún no llegan los re-registros del nuevo primary, así que excluir
+    por tiempo marcaría caídos a DataNodes que están vivos (R9).
+    """
+    if grace:
+        return db.execute(
+            "SELECT * FROM nodes WHERE status = 'online' ORDER BY id"
+        ).fetchall()
     return db.execute(
         "SELECT * FROM nodes WHERE status = 'online' AND last_heartbeat >= ? ORDER BY id",
         (now_timestamp - timeout,),

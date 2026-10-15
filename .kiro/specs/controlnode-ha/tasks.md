@@ -99,12 +99,15 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: R3, R4, R5.1, R5.4-5.6_
   - _Commit: `feat(ha): replicador del standby con failover y fencing por época`_
 
-- [ ] 7. Periodo de gracia para DataNodes tras promoción
-  - [ ] 7.1 Pasar `grace_until` a `_available_data_nodes()` / `available_nodes`
-    para no excluir DataNodes por heartbeat viejo durante la gracia (R9.1).
-  - [ ] 7.2 Asegurar que `/nodes/register` y `/nodes/{id}/heartbeat` del nuevo
-    primary refrescan el estado durante la gracia (R9.2-9.3).
-  - [ ] 7.3 Prueba `test_gracia_datanodes`.
+- [x] 7. Periodo de gracia para DataNodes tras promoción
+  - [x] 7.1 Pasar `grace` a `_available_data_nodes()` / `available_nodes` para no
+    excluir DataNodes por heartbeat viejo durante la gracia (R9.1). Parámetro
+    opcional con default que conserva el comportamiento previo.
+  - [x] 7.2 `/nodes/register` y `/nodes/{id}/heartbeat` refrescan last_heartbeat y
+    status, así que el re-registro durante la gracia funciona sin cambios (R9.2-9.3).
+  - [x] 7.3 Pruebas: `test_available_nodes_igual_que_hoy_sin_gracia` (demuestra
+    comportamiento idéntico fuera de la gracia), `test_available_nodes_en_gracia_no_filtra_por_heartbeat`,
+    `test_in_grace_controla_el_filtrado`.
   - _Requisitos: R9_
   - _Commit: `feat(ha): periodo de gracia de DataNodes tras promoción`_
 

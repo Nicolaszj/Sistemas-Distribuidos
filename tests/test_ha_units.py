@@ -5,6 +5,7 @@ No dependen de Docker: usan recarga de módulos y TestClient de FastAPI.
 
 import importlib
 import os
+import time
 
 import pytest
 
@@ -584,3 +585,79 @@ def test_promocion_por_timeout(monkeypatch, tmp_path):
     state.promote()
     assert state.role == "primary"
     assert state.epoch == 1
+
+
+# --- Tarea 7: periodo de gracia de DataNodes tras promoción ---------------------
+
+
+@pytest.fixture
+def nodes_db(tmp_path, monkeypatch):
+    from dfsha.server import config as config_module
+    from dfsha.server import metadata
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "metadata.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    monkeypatch.setattr(config_module, "NODE_TIMEOUT_SECONDS", 30)
+    metadata.initialize()
+    return metadata
+
+
+def test_available_nodes_igual_que_hoy_sin_gracia(nodes_db):
+    """Fuera del periodo de gracia, available_nodes filtra por heartbeat como siempre."""
+    metadata = nodes_db
+    now = 1000.0
+    with metadata.connect() as db:
+        metadata.register_node(db, "fresco", "http://fresco:8000", now)
+        metadata.register_node(db, "viejo", "http://viejo:8000", now - 100)  # fuera de timeout
+
+    with metadata.connect() as db:
+        vivos = metadata.available_nodes(db, now, 30)  # grace=False por defecto
+    ids = {row["id"] for row in vivos}
+    # El viejo (heartbeat > timeout) queda excluido, exactamente como antes del hito 3.
+    assert ids == {"fresco"}
+
+
+def test_available_nodes_en_gracia_no_filtra_por_heartbeat(nodes_db):
+    """Durante la gracia, un DataNode con heartbeat viejo sigue contando como vivo."""
+    metadata = nodes_db
+    now = 1000.0
+    with metadata.connect() as db:
+        metadata.register_node(db, "fresco", "http://fresco:8000", now)
+        metadata.register_node(db, "viejo", "http://viejo:8000", now - 100)
+
+    with metadata.connect() as db:
+        vivos = metadata.available_nodes(db, now, 30, grace=True)
+    ids = {row["id"] for row in vivos}
+    assert ids == {"fresco", "viejo"}
+
+    # Un nodo marcado offline no reaparece ni en gracia.
+    with metadata.connect() as db:
+        db.execute("UPDATE nodes SET status = 'offline' WHERE id = 'viejo'")
+        vivos = metadata.available_nodes(db, now, 30, grace=True)
+    assert {row["id"] for row in vivos} == {"fresco"}
+
+
+def test_in_grace_controla_el_filtrado(tmp_path, monkeypatch):
+    """_available_data_nodes usa grace solo mientras ha.state.in_grace() es True."""
+    from dfsha.server import config as config_module
+    from dfsha.server import ha, main, metadata
+
+    monkeypatch.setattr(config_module, "DATABASE_PATH", tmp_path / "metadata.db")
+    monkeypatch.setattr(config_module, "HA_ROLE", "primary")
+    monkeypatch.setattr(config_module, "NODE_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(config_module, "HA_GRACE_SECONDS", 30)
+    metadata.initialize()
+    fresh = ha.HaState().load()
+    monkeypatch.setattr(ha, "state", fresh)
+
+    now = time.time()
+    with metadata.connect() as db:
+        metadata.register_node(db, "viejo", "http://viejo:8000", now - 1000)
+
+    # Sin promoción: no hay gracia, el nodo viejo no cuenta.
+    assert main._available_data_nodes() == []
+
+    # Tras promover: durante la gracia, el nodo viejo sí cuenta.
+    fresh.promote()
+    assert fresh.in_grace() is True
+    assert {row["id"] for row in main._available_data_nodes()} == {"viejo"}

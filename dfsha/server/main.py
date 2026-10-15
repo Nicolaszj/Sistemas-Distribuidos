@@ -679,9 +679,10 @@ def unlock_file(request: PathRequest, user_id: int = Depends(current_user)):
 
 
 def _available_data_nodes():
+    grace = ha.state.in_grace()
     with metadata.connect() as db:
         nodes = metadata.available_nodes(
-            db, time.time(), config.NODE_TIMEOUT_SECONDS
+            db, time.time(), config.NODE_TIMEOUT_SECONDS, grace=grace
         )
         if not nodes and config.DATANODES:
             for index, url in enumerate(config.DATANODES):
@@ -689,7 +690,7 @@ def _available_data_nodes():
                     db, f"static-{index}", url, time.time()
                 )
             nodes = metadata.available_nodes(
-                db, time.time(), config.NODE_TIMEOUT_SECONDS
+                db, time.time(), config.NODE_TIMEOUT_SECONDS, grace=grace
             )
         return nodes
 
