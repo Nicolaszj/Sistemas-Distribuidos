@@ -321,3 +321,32 @@ def test_apply_entries_avanza_secuencia(tmp_path, monkeypatch):
     with metadata.connect() as db:
         user = metadata.find_user(db, "ana2")
     assert user is not None
+
+
+# --- Tarea 4: token de operador para /ha/promote -------------------------------
+
+
+def test_admin_token_valido():
+    from dfsha import cluster_auth
+
+    secret = "secreto-de-pruebas"
+    token = cluster_auth.issue_admin_token(secret)
+    assert cluster_auth.verify_admin_token(secret, token) == "operator"
+
+
+def test_admin_token_sin_claim_falla():
+    from dfsha import cluster_auth
+
+    secret = "secreto-de-pruebas"
+    # Un token de nodo normal (sin adm) no sirve como operador.
+    normal = cluster_auth.issue_node_token(secret, "dn1")
+    with pytest.raises(cluster_auth.InvalidClusterToken):
+        cluster_auth.verify_admin_token(secret, normal)
+
+
+def test_admin_token_firma_mala_falla():
+    from dfsha import cluster_auth
+
+    token = cluster_auth.issue_admin_token("secreto-bueno")
+    with pytest.raises(cluster_auth.InvalidClusterToken):
+        cluster_auth.verify_admin_token("secreto-malo", token)

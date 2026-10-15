@@ -60,10 +60,10 @@ Convención: `[ ]` pendiente. Las referencias "R#" apuntan a `requirements.md`.
   - _Requisitos: R3.1-3.3, R5.1-5.3, R9, ajuste 6_
   - _Commit: `feat(ha): módulo ha.py con snapshot, promoción y degradación`_
 
-- [ ] 4. Autenticación de operador en `cluster_auth.py`
-  - [ ] 4.1 Añadir claim admin (`adm: true`) con `issue_admin_token(secret)` y
+- [x] 4. Autenticación de operador en `cluster_auth.py`
+  - [x] 4.1 Añadir claim admin (`adm: true`) con `issue_admin_token(secret)` y
     `verify_admin_token(secret, token)` reutilizando el token de nodo.
-  - [ ] 4.2 Prueba unitaria del token admin (válido / sin claim / firma mala).
+  - [x] 4.2 Prueba unitaria del token admin (válido / sin claim / firma mala).
   - _Requisitos: ajuste 3 (R5.2)_
   - _Commit: `feat(ha): token de operador para /ha/promote`_
 
